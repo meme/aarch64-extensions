@@ -1,0 +1,6 @@
+[submodule "capstone"]
+	path = capstone
+	url = https://github.com/aquynh/capstone.git
+[submodule "binaryninja-api"]
+	path = binaryninja-api
+	url = git@github.com:meme/binaryninja-api.git
