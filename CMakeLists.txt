@@ -3,10 +3,6 @@ cmake_minimum_required(VERSION 3.1)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_STANDARD 11)
 
-find_library(BINJA_CORE_LIBRARY
-    NAMES binaryninjacore libbinaryninjacore.so.1
-    PATHS /opt/binaryninja)
-
 add_subdirectory(binaryninja-api)
 
 # This is a bad joke, right? Right?
