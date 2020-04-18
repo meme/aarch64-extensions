@@ -1,7 +1,10 @@
+#include <algorithm>
 #include <binaryninjaapi.h>
+#include <lowlevelilinstruction.h>
 #include <capstone/capstone.h>
 
 using namespace BinaryNinja;
+using string = std::string;
 
 // #define AARCH64_TRACE_INSTR
 
@@ -47,6 +50,8 @@ public:
 static thread_local Disassembler disassembler;
 
 class AArch64ArchitectureExtension : public ArchitectureHook {
+  std::map<uint32_t, NameAndType> mIntrinsics;
+  std::map<const char *, uint32_t> mIntrinsicNames;
 private:
   /**
    * Convert a Capstone condition code to BNIL condition code
@@ -98,6 +103,53 @@ private:
 public:
   explicit AArch64ArchitectureExtension(Architecture* aarch64)
       : ArchitectureHook(aarch64) {
+    std::vector<uint32_t> intrinsics = this->m_base->GetAllIntrinsics();
+    uint32_t intrinsic = 0;
+    if (intrinsics.size() > 0) {
+      intrinsic = 1 + *max_element(intrinsics.begin(), intrinsics.end());
+    }
+
+    /*
+     * Declare new architecture intrinsics
+     */
+
+    mIntrinsicNames["__builtin_mrs"] = intrinsic;
+    mIntrinsics[intrinsic++] = NameAndType("__builtin_mrs",
+            Type::FunctionType(
+                Confidence<Ref<Type>>(Type::IntegerType(8, Confidence<bool>(true), "")), /* return */
+                Confidence<Ref<CallingConvention>>(this->m_base->GetDefaultCallingConvention()), /* calling convention */
+                std::vector<FunctionParameter> {
+                  FunctionParameter { /* arg1 */
+                    "reg",
+                    Confidence<Ref<Type>>(Type::IntegerType(8, Confidence<bool>(true), "")),
+                    true,
+                    Variable()
+                  }
+                }, /* args */
+                Confidence<bool>(false), /* varArg */
+                Confidence<int64_t>(0))); /* stackAdjust */
+
+    mIntrinsicNames["__builtin_msr"] = intrinsic;
+    mIntrinsics[intrinsic++] = NameAndType("__builtin_msr",
+            Type::FunctionType(
+                Confidence<Ref<Type>>(Type::VoidType()), /* return */
+                Confidence<Ref<CallingConvention>>(this->m_base->GetDefaultCallingConvention()), /* calling convention */
+                std::vector<FunctionParameter> {
+                  FunctionParameter { /* arg1 */
+                    "reg",
+                    Confidence<Ref<Type>>(Type::IntegerType(8, Confidence<bool>(true), "")),
+                    true,
+                    Variable()
+                  },
+                  FunctionParameter { /* arg2 */
+                    "val",
+                    Confidence<Ref<Type>>(Type::IntegerType(8, Confidence<bool>(true), "")),
+                    true,
+                    Variable()  /* arg2 */
+                  }
+                },
+                Confidence<bool>(false), /* varArg */
+                Confidence<int64_t>(0))); /* stackAdjust */
   }
 
   bool LiftCSINC(cs_insn* instr, LowLevelILFunction& il) {
@@ -297,6 +349,122 @@ public:
     return false;
   }
 
+  bool LiftFMOV(cs_insn* instr, LowLevelILFunction& il) {
+    cs_arm64* detail = &(instr->detail->arm64);
+
+    if (detail->op_count != 2) {
+      return false;
+    }
+
+    if (detail->operands[0].type != ARM64_OP_REG
+        || detail->operands[1].type != ARM64_OP_REG) {
+      return false;
+    }
+
+    uint32_t Rd = this->m_base->GetRegisterByName(
+        cs_reg_name(disassembler.Get(), detail->operands[0].reg));
+    uint32_t Rn = this->m_base->GetRegisterByName(
+        cs_reg_name(disassembler.Get(), detail->operands[1].reg));
+
+    size_t Rd_size = this->m_base->GetRegisterInfo(Rd).size;
+    size_t Rn_size = this->m_base->GetRegisterInfo(Rd).size;
+
+    if (Rd_size != Rn_size) {
+      return false;
+    }
+
+    il.AddInstruction(
+        il.SetRegister(Rd_size, Rd, il.Register(Rd_size, Rn)));
+
+    return true;
+  }
+
+  bool LiftMRS(cs_insn* instr, LowLevelILFunction& il) {
+    cs_arm64* detail = &(instr->detail->arm64);
+
+    if (detail->op_count != 2) {
+      return false;
+    }
+
+    if (detail->operands[0].type != ARM64_OP_REG
+        || detail->operands[1].type != ARM64_OP_REG_MRS) {
+      return false;
+    }
+
+    uint32_t Rd = this->m_base->GetRegisterByName(
+        cs_reg_name(disassembler.Get(), detail->operands[0].reg));
+    uint32_t Rn = detail->operands[1].reg;
+
+    size_t Rd_size = this->m_base->GetRegisterInfo(Rd).size;
+    size_t Rn_size = 8;
+
+    if (Rd_size != Rn_size) {
+      return false;
+    }
+
+    il.AddInstruction(
+        il.Intrinsic(std::vector<RegisterOrFlag> { RegisterOrFlag(false, Rd) },
+                     mIntrinsicNames["__builtin_mrs"],
+                     std::vector<ExprId> { il.Const(Rn_size, Rn, ILSourceLocation(instr->address, 1)) },
+                     0,
+                     ILSourceLocation(instr->address, 0) ));
+
+    return true;
+  }
+
+  bool LiftMSR(cs_insn* instr, LowLevelILFunction& il) {
+    cs_arm64* detail = &(instr->detail->arm64);
+
+    if (detail->op_count != 2) {
+      return false;
+    }
+
+    if (detail->operands[0].type != ARM64_OP_REG_MSR) {
+      return false;
+    }
+
+    uint32_t Rd = detail->operands[0].reg;
+    const size_t Rd_size = 8;
+
+    ExprId srcExpr;
+
+    switch (detail->operands[1].type) {
+    case ARM64_OP_REG_MSR:
+        {
+            uint32_t Rn = this->m_base->GetRegisterByName(
+                cs_reg_name(disassembler.Get(), detail->operands[1].reg));
+
+            size_t Rn_size = this->m_base->GetRegisterInfo(Rn).size;
+
+            if (Rd_size != Rn_size) {
+              return false;
+            }
+
+            srcExpr = il.Register(Rn_size, Rn);
+        }
+        break;
+    case ARM64_OP_IMM:
+        srcExpr = il.Const(Rd_size,
+                           detail->operands[0].imm,
+                           ILSourceLocation(instr->address, 1));
+        break;
+    default:
+        return false;
+    }
+
+    il.AddInstruction(
+        il.Intrinsic(std::vector<RegisterOrFlag> {},
+                     mIntrinsicNames["__builtin_msr"],
+                     std::vector<ExprId> {
+                       il.Const(Rd_size, Rd, ILSourceLocation(instr->address, 0)),
+                       srcExpr
+                     },
+                     0,
+                     ILSourceLocation(instr->address, 0) ));
+
+    return true;
+  }
+
   bool GetInstructionLowLevelIL(const uint8_t* data, uint64_t addr, size_t& len,
                                 LowLevelILFunction& il) override {
     cs_insn* instr;
@@ -335,11 +503,29 @@ public:
 #endif
         supported = LiftROR(instr, il);
         break;
+      case ARM64_INS_FMOV:
+#ifdef AARCH64_TRACE_INSTR
+        LogInfo("FMOV @ 0x%lx", instr->address);
+#endif
+        supported = LiftFMOV(instr, il);
+        break;
+      case ARM64_INS_MRS:
+#ifdef AARCH64_TRACE_INSTR
+        LogInfo("MRS @ 0x%lx", instr->address);
+#endif
+        supported = LiftMRS(instr, il);
+        break;
+      case ARM64_INS_MSR:
+#ifdef AARCH64_TRACE_INSTR
+        LogInfo("MSR @ 0x%lx", instr->address);
+#endif
+        supported = LiftMSR(instr, il);
+        break;
       }
     }
 
-    len = instr->size;
     if (count > 0) {
+      len = instr->size;
       cs_free(instr, count);
     }
 
@@ -348,6 +534,57 @@ public:
     }
 
     return true;
+  }
+
+  string GetIntrinsicName(uint32_t intrinsic) override {
+    std::map<uint32_t, NameAndType>::iterator it = mIntrinsics.find(intrinsic);
+    if (it == mIntrinsics.end()) {
+      return ArchitectureHook::GetIntrinsicName(intrinsic);
+    } else {
+      return it->second.name;
+    }
+  }
+
+  std::vector<uint32_t> GetAllIntrinsics() override {
+    std::vector<uint32_t> base = ArchitectureHook::GetAllIntrinsics();
+
+    for (auto &instr : mIntrinsics) {
+      base.push_back(instr.first);
+    }
+
+    return base;
+  }
+
+  std::vector<NameAndType> GetIntrinsicInputs(uint32_t intrinsic) override {
+    std::map<uint32_t, NameAndType>::iterator it = mIntrinsics.find(intrinsic);
+    if (it == mIntrinsics.end()) {
+      return ArchitectureHook::GetIntrinsicInputs(intrinsic);
+    } else {
+      std::vector<FunctionParameter> parms = it->second.type.GetValue()->GetParameters();
+      std::vector<NameAndType> inputs;
+
+      inputs.reserve(parms.size());
+
+      for (auto &parm : parms) {
+        inputs.push_back(NameAndType(parm.name, parm.type));
+      }
+
+      return inputs;
+    }
+  }
+
+  std::vector<Confidence<Ref<Type>>> GetIntrinsicOutputs(uint32_t intrinsic) override {
+    std::map<uint32_t, NameAndType>::iterator it = mIntrinsics.find(intrinsic);
+    if (it == mIntrinsics.end()) {
+      return ArchitectureHook::GetIntrinsicOutputs(intrinsic);
+    } else {
+      Confidence<Ref<Type>> retType = it->second.type.GetValue()->GetChildType();
+      if (retType.GetValue() == Type::VoidType()) {
+        return std::vector<Confidence<Ref<Type>>> {};
+      } else {
+        return std::vector<Confidence<Ref<Type>>> { retType };
+      }
+    }
   }
 };
 
