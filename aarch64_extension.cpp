@@ -14,10 +14,40 @@ template <typename T> inline T Ones(size_t count) {
   }
 }
 
+class Disassembler {
+private:
+  csh mCapstone {};
+  bool mIsOK = true;
+public:
+  Disassembler() noexcept {
+    if (cs_open(CS_ARCH_ARM64, CS_MODE_ARM, &mCapstone) != CS_ERR_OK) {
+      mIsOK = false;
+      return;
+    }
+
+    cs_option(mCapstone, CS_OPT_DETAIL, CS_OPT_ON);
+  }
+
+  ~Disassembler() {
+    cs_close(&mCapstone);
+  }
+
+  bool IsOK() const {
+    return mIsOK;
+  }
+
+  csh Get() const {
+    return mCapstone;
+  }
+};
+
+// Disassembler _must_ be thread_local because on multi-threaded analysis GetInstructionLowLevelIL may be called
+// from multiple threads, thus causing Capstone to malfunction. Note that on thread exit the destructor will
+// be called and the associated Capstone resources will be released
+static thread_local Disassembler disassembler;
+
 class AArch64ArchitectureExtension : public ArchitectureHook {
 private:
-  csh mCapstone{};
-
   /**
    * Convert a Capstone condition code to BNIL condition code
    *
@@ -68,14 +98,7 @@ private:
 public:
   explicit AArch64ArchitectureExtension(Architecture* aarch64)
       : ArchitectureHook(aarch64) {
-    if (cs_open(CS_ARCH_ARM64, CS_MODE_ARM, &mCapstone) != CS_ERR_OK) {
-      LogError("Failed to create AArch64 disassembler engine");
-    }
-
-    cs_option(mCapstone, CS_OPT_DETAIL, CS_OPT_ON);
   }
-
-  ~AArch64ArchitectureExtension() override { cs_close(&mCapstone); }
 
   bool LiftCSINC(cs_insn* instr, LowLevelILFunction& il) {
     cs_arm64* detail = &(instr->detail->arm64);
@@ -85,11 +108,11 @@ public:
     }
 
     uint32_t Rd = this->m_base->GetRegisterByName(
-        cs_reg_name(mCapstone, detail->operands[0].reg));
+        cs_reg_name(disassembler.Get(), detail->operands[0].reg));
     uint32_t Rn = this->m_base->GetRegisterByName(
-        cs_reg_name(mCapstone, detail->operands[1].reg));
+        cs_reg_name(disassembler.Get(), detail->operands[1].reg));
     uint32_t Rm = this->m_base->GetRegisterByName(
-        cs_reg_name(mCapstone, detail->operands[2].reg));
+        cs_reg_name(disassembler.Get(), detail->operands[2].reg));
     size_t Rd_size = this->m_base->GetRegisterInfo(Rd).size;
     size_t Rn_size = this->m_base->GetRegisterInfo(Rn).size;
     size_t Rm_size = this->m_base->GetRegisterInfo(Rm).size;
@@ -135,11 +158,11 @@ public:
     }
 
     uint32_t Xd = this->m_base->GetRegisterByName(
-        cs_reg_name(mCapstone, detail->operands[0].reg));
+        cs_reg_name(disassembler.Get(), detail->operands[0].reg));
     uint32_t Wn = this->m_base->GetRegisterByName(
-        cs_reg_name(mCapstone, detail->operands[1].reg));
+        cs_reg_name(disassembler.Get(), detail->operands[1].reg));
     uint32_t Wm = this->m_base->GetRegisterByName(
-        cs_reg_name(mCapstone, detail->operands[2].reg));
+        cs_reg_name(disassembler.Get(), detail->operands[2].reg));
 
     il.AddInstruction(il.SetRegister(
         8, Xd, il.Mult(8, il.Register(4, Wn), il.Register(4, Wm))));
@@ -155,9 +178,9 @@ public:
     }
 
     uint32_t Rd = this->m_base->GetRegisterByName(
-        cs_reg_name(mCapstone, detail->operands[0].reg));
+        cs_reg_name(disassembler.Get(), detail->operands[0].reg));
     uint32_t Rn = this->m_base->GetRegisterByName(
-        cs_reg_name(mCapstone, detail->operands[1].reg));
+        cs_reg_name(disassembler.Get(), detail->operands[1].reg));
     size_t Rd_size = this->m_base->GetRegisterInfo(Rd).size;
     size_t Rn_size = this->m_base->GetRegisterInfo(Rn).size;
 
@@ -202,9 +225,9 @@ public:
     }
 
     uint32_t Rd = this->m_base->GetRegisterByName(
-        cs_reg_name(mCapstone, detail->operands[0].reg));
+        cs_reg_name(disassembler.Get(), detail->operands[0].reg));
     uint32_t Rn = this->m_base->GetRegisterByName(
-        cs_reg_name(mCapstone, detail->operands[1].reg));
+        cs_reg_name(disassembler.Get(), detail->operands[1].reg));
     size_t Rd_size = this->m_base->GetRegisterInfo(Rd).size;
     size_t Rn_size = this->m_base->GetRegisterInfo(Rd).size;
     int64_t lsb = detail->operands[2].imm;
@@ -234,7 +257,6 @@ public:
   }
 
   bool LiftROR(cs_insn* instr, LowLevelILFunction& il) {
-    // 00003edc
     cs_arm64* detail = &(instr->detail->arm64);
 
     if (detail->op_count != 3) {
@@ -242,9 +264,9 @@ public:
     }
 
     uint32_t Rd = this->m_base->GetRegisterByName(
-        cs_reg_name(mCapstone, detail->operands[0].reg));
+        cs_reg_name(disassembler.Get(), detail->operands[0].reg));
     uint32_t Rn = this->m_base->GetRegisterByName(
-        cs_reg_name(mCapstone, detail->operands[1].reg));
+        cs_reg_name(disassembler.Get(), detail->operands[1].reg));
 
     size_t Rd_size = this->m_base->GetRegisterInfo(Rd).size;
     size_t Rn_size = this->m_base->GetRegisterInfo(Rd).size;
@@ -255,7 +277,7 @@ public:
 
     if (detail->operands[2].type == ARM64_OP_REG) {
       uint32_t Rm = this->m_base->GetRegisterByName(
-          cs_reg_name(mCapstone, detail->operands[2].reg));
+          cs_reg_name(disassembler.Get(), detail->operands[2].reg));
 
       il.AddInstruction(
           il.SetRegister(Rd_size, Rd,
@@ -278,7 +300,7 @@ public:
   bool GetInstructionLowLevelIL(const uint8_t* data, uint64_t addr, size_t& len,
                                 LowLevelILFunction& il) override {
     cs_insn* instr;
-    size_t count = cs_disasm(mCapstone, data, len, addr, 0, &instr);
+    size_t count = cs_disasm(disassembler.Get(), data, len, addr, 0, &instr);
 
     bool supported = false;
     if (count > 0) {
@@ -335,10 +357,17 @@ BINARYNINJAPLUGIN void CorePluginDependencies() {
 }
 
 BINARYNINJAPLUGIN bool CorePluginInit() {
-  LogInfo("Registered AArch64 extensions plugin");
+  if (!disassembler.IsOK()) {
+    LogError("Failed to create AArch64 disassembler engine");
+    return false;
+  }
+
   Architecture* aarch64Ext =
       new AArch64ArchitectureExtension(Architecture::GetByName("aarch64"));
   Architecture::Register(aarch64Ext);
+
+  LogInfo("Registered AArch64 extensions plugin");
+
   return true;
 }
 }
