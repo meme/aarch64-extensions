@@ -1,0 +1,8 @@
+---
+Language: Cpp
+BasedOnStyle: LLVM
+PointerAlignment: Left
+SpaceAfterCStyleCast: true
+Standard: Cpp11
+TabWidth: 4
+UseTab: Never

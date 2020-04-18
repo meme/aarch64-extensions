@@ -6,6 +6,7 @@ Binary Ninja IL lifting extensions for AArch64
 - [x] CSINC
 - [x] UMULL
 - [x] CINC
+- [x] BFI
 - [ ] MRS
 - ... (make a GitHub issue)
 

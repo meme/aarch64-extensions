@@ -3,244 +3,294 @@
 
 using namespace BinaryNinja;
 
+// #define AARCH64_TRACE_INSTR
+
+// Returns 1s expanded to count, e.g.: Count<uint8_t>(7) == 0b01111111
+template <typename T> inline T Ones(size_t count) {
+  if (count == sizeof(T) * 8) {
+    return static_cast<T>(~static_cast<T>(0));
+  } else {
+    return ~(static_cast<T>(~static_cast<T>(0)) << count);
+  }
+}
+
 class AArch64ArchitectureExtension : public ArchitectureHook {
 private:
-    csh capstone_ {};
+  csh mCapstone{};
+
+  /**
+   * Convert a Capstone condition code to BNIL condition code
+   *
+   * @param condition AArch64 condition code
+   * @return BNIL condition, or -1
+   */
+  static BNLowLevelILFlagCondition LiftCondition(arm64_cc condition) {
+    switch (condition) {
+    case ARM64_CC_EQ:
+      return LLFC_E;
+    case ARM64_CC_NE:
+      return LLFC_NE;
+    case ARM64_CC_HS:
+      return LLFC_UGE;
+    case ARM64_CC_LO:
+      return LLFC_ULE;
+    case ARM64_CC_MI:
+      return LLFC_NEG;
+    case ARM64_CC_PL:
+      return LLFC_POS;
+    case ARM64_CC_VS:
+      return LLFC_O;
+    case ARM64_CC_VC:
+      return LLFC_NO;
+    case ARM64_CC_HI:
+      return LLFC_UGE;
+    case ARM64_CC_LS:
+      return LLFC_ULE;
+    case ARM64_CC_GE:
+      return LLFC_SGE;
+    case ARM64_CC_LT:
+      return LLFC_SLT;
+    case ARM64_CC_GT:
+      return LLFC_SGT;
+    case ARM64_CC_LE:
+      return LLFC_SLE;
+    case ARM64_CC_INVALID:
+      return (BNLowLevelILFlagCondition) ARM64_CC_INVALID;
+    case ARM64_CC_AL:
+      return (BNLowLevelILFlagCondition) ARM64_CC_AL;
+    case ARM64_CC_NV:
+      return (BNLowLevelILFlagCondition) ARM64_CC_NV;
+    }
+
+    return (BNLowLevelILFlagCondition) -1;
+  }
 
 public:
-	explicit AArch64ArchitectureExtension(Architecture* aarch64) : ArchitectureHook(aarch64) {
-        if (cs_open(CS_ARCH_ARM64, CS_MODE_ARM, &capstone_) != CS_ERR_OK) {
-            LogError("Failed to create AArch64 disassembler engine");
-        }
+  explicit AArch64ArchitectureExtension(Architecture* aarch64)
+      : ArchitectureHook(aarch64) {
+    if (cs_open(CS_ARCH_ARM64, CS_MODE_ARM, &mCapstone) != CS_ERR_OK) {
+      LogError("Failed to create AArch64 disassembler engine");
+    }
 
-        cs_option(capstone_, CS_OPT_DETAIL, CS_OPT_ON);
-	}
+    cs_option(mCapstone, CS_OPT_DETAIL, CS_OPT_ON);
+  }
 
-	~AArch64ArchitectureExtension() override {
-	    cs_close(&capstone_);
-	}
+  ~AArch64ArchitectureExtension() override { cs_close(&mCapstone); }
 
-    static BNLowLevelILFlagCondition LiftCondition(arm64_cc condition)  {
-        switch (condition) {
-        case ARM64_CC_EQ:
-            return LLFC_E;
-        case ARM64_CC_NE:
-            return LLFC_NE;
-        case ARM64_CC_HS:
-            return LLFC_UGE;
-        case ARM64_CC_LO:
-            return LLFC_ULE;
-        case ARM64_CC_MI:
-            return LLFC_NEG;
-        case ARM64_CC_PL:
-            return LLFC_POS;
-        case ARM64_CC_VS:
-            return LLFC_O;
-        case ARM64_CC_VC:
-            return LLFC_NO;
-        case ARM64_CC_HI:
-            return LLFC_UGE;
-        case ARM64_CC_LS:
-            return LLFC_ULE;
-        case ARM64_CC_GE:
-            return LLFC_SGE;
-        case ARM64_CC_LT:
-            return LLFC_SLT;
-        case ARM64_CC_GT:
-            return LLFC_SGT;
-        case ARM64_CC_LE:
-            return LLFC_SLE;
-        case ARM64_CC_INVALID:
-            return (BNLowLevelILFlagCondition) ARM64_CC_INVALID;
-        case ARM64_CC_AL:
-            return (BNLowLevelILFlagCondition) ARM64_CC_AL;
-        case ARM64_CC_NV:
-            return (BNLowLevelILFlagCondition) ARM64_CC_NV;
-        }
+  bool LiftCSINC(cs_insn* instr, LowLevelILFunction& il) {
+    cs_arm64* detail = &(instr->detail->arm64);
 
-        return (BNLowLevelILFlagCondition) -1;
-	}
+    if (detail->op_count != 3) {
+      return false;
+    }
 
-	bool LiftCSINC(cs_insn* instr, LowLevelILFunction& il) {
-        cs_arm64* detail = &(instr->detail->arm64);
+    uint32_t Rd = this->m_base->GetRegisterByName(
+        cs_reg_name(mCapstone, detail->operands[0].reg));
+    uint32_t Rn = this->m_base->GetRegisterByName(
+        cs_reg_name(mCapstone, detail->operands[1].reg));
+    uint32_t Rm = this->m_base->GetRegisterByName(
+        cs_reg_name(mCapstone, detail->operands[2].reg));
+    size_t Rd_size = this->m_base->GetRegisterInfo(Rd).size;
+    size_t Rn_size = this->m_base->GetRegisterInfo(Rn).size;
+    size_t Rm_size = this->m_base->GetRegisterInfo(Rm).size;
 
-        // FIXME(keegan) assert op_count == 3, all registers are Xd, or Rd and that all 3 operands are registers!
+    if (detail->cc == ARM64_CC_INVALID ||
+        (Rd_size != Rn_size && Rn_size != Rm_size)) {
+      return false;
+    }
 
-        uint32_t Rd = this->m_base->GetRegisterByName(cs_reg_name(capstone_, detail->operands[0].reg));
-        uint32_t Rn = this->m_base->GetRegisterByName(cs_reg_name(capstone_, detail->operands[1].reg));
-        uint32_t Rm = this->m_base->GetRegisterByName(cs_reg_name(capstone_, detail->operands[2].reg));
+    // Never is actually _always_, Capstone internal
+    if (detail->cc == ARM64_CC_AL || detail->cc == ARM64_CC_NV) {
+      il.AddInstruction(il.SetRegister(Rd_size, il.Register(Rd_size, Rd),
+                                       il.Register(Rn_size, Rn)));
+      return true;
+    }
 
-//        LogInfo("%s %s %s", this->m_base->GetRegisterName(Rd).c_str(), this->m_base->GetRegisterName(Rn).c_str(), this->m_base->GetRegisterName(Rm).c_str());
+    LowLevelILLabel assignmentLabel, incrementLabel, afterLabel;
 
-        size_t Rd_size = this->m_base->GetRegisterInfo(Rd).size;
-        size_t Rn_size = this->m_base->GetRegisterInfo(Rn).size;
-        size_t Rm_size = this->m_base->GetRegisterInfo(Rm).size;
+    il.AddInstruction(il.If(il.FlagCondition(LiftCondition(detail->cc)),
+                            assignmentLabel, incrementLabel));
 
-//        LogInfo("Rd %lu, Rn %lu, Rm %lu", Rd_size, Rn_size, Rm_size);
+    // Rd = Rn
+    il.MarkLabel(assignmentLabel);
+    il.AddInstruction(il.SetRegister(Rd_size, Rd, il.Register(Rn_size, Rn)));
+    il.AddInstruction(il.Goto(afterLabel));
 
-        // FIXME(keegan) XZR needs to be lifted to a constant 0
-        // FIXME(keegan) assert all sizes are the same
+    // Rd = Rm + 1
+    il.MarkLabel(incrementLabel);
+    il.AddInstruction(il.SetRegister(
+        Rd_size, Rd,
+        il.Add(Rd_size, il.Register(Rm_size, Rm), il.Const(Rd_size, 1))));
 
-        if (detail->cc == ARM64_CC_INVALID) {
-            return false;
-        }
+    il.MarkLabel(afterLabel);
 
-        // Never is actually _always_, Capstone internal
-        if (detail->cc == ARM64_CC_AL || detail->cc == ARM64_CC_NV) {
-            il.AddInstruction(il.SetRegister(Rd_size, il.Register(Rd_size, Rd), il.Register(Rn_size, Rn)));
-            return true;
-        }
+    return true;
+  }
 
-        LowLevelILLabel assignment_label;
-        LowLevelILLabel increment_label;
-        LowLevelILLabel after_label;
+  bool LiftUMULL(cs_insn* instr, LowLevelILFunction& il) {
+    cs_arm64* detail = &(instr->detail->arm64);
 
-        il.AddInstruction(il.If(il.FlagCondition(LiftCondition(detail->cc)), assignment_label, increment_label));
+    if (detail->op_count != 3) {
+      return false;
+    }
 
-        // Rd = Rn
-        il.MarkLabel(assignment_label);
-        il.AddInstruction(il.SetRegister(Rd_size, Rd, il.Register(Rn_size, Rn)));
-        il.AddInstruction(il.Goto(after_label));
+    uint32_t Xd = this->m_base->GetRegisterByName(
+        cs_reg_name(mCapstone, detail->operands[0].reg));
+    uint32_t Wn = this->m_base->GetRegisterByName(
+        cs_reg_name(mCapstone, detail->operands[1].reg));
+    uint32_t Wm = this->m_base->GetRegisterByName(
+        cs_reg_name(mCapstone, detail->operands[2].reg));
 
-        // Rd = Rm + 1
-        il.MarkLabel(increment_label);
-        il.AddInstruction(
-                il.SetRegister(Rd_size, Rd, il.Add(Rd_size, il.Register(Rm_size, Rm), il.Const(Rd_size, 1))));
+    il.AddInstruction(il.SetRegister(
+        8, Xd, il.Mult(8, il.Register(4, Wn), il.Register(4, Wm))));
 
-        il.MarkLabel(after_label);
+    return true;
+  }
 
-	    return true;
-	}
+  bool LiftCINC(cs_insn* instr, LowLevelILFunction& il) {
+    cs_arm64* detail = &(instr->detail->arm64);
 
-	bool LiftUMULL(cs_insn* instr, LowLevelILFunction& il) {
-        cs_arm64* detail = &(instr->detail->arm64);
+    if (detail->op_count != 2) {
+      return false;
+    }
 
-        // FIXME(keegan) ensure 64-bit, 32-bit, 32-bit respectively
-        uint32_t Xd = this->m_base->GetRegisterByName(cs_reg_name(capstone_, detail->operands[0].reg));
-        uint32_t Wn = this->m_base->GetRegisterByName(cs_reg_name(capstone_, detail->operands[1].reg));
-        uint32_t Wm = this->m_base->GetRegisterByName(cs_reg_name(capstone_, detail->operands[2].reg));
+    uint32_t Rd = this->m_base->GetRegisterByName(
+        cs_reg_name(mCapstone, detail->operands[0].reg));
+    uint32_t Rn = this->m_base->GetRegisterByName(
+        cs_reg_name(mCapstone, detail->operands[1].reg));
+    size_t Rd_size = this->m_base->GetRegisterInfo(Rd).size;
+    size_t Rn_size = this->m_base->GetRegisterInfo(Rn).size;
 
-        il.AddInstruction(
-                il.SetRegister(8,
-                        Xd,
-                        il.Mult(8, il.Register(4, Wn), il.Register(4, Wm))));
+    if (detail->cc == ARM64_CC_INVALID) {
+      return false;
+    }
 
-	    return true;
-	}
+    if (detail->cc == ARM64_CC_AL || detail->cc == ARM64_CC_NV) {
+      // Rd = Rn + 1
+      il.AddInstruction(il.SetRegister(
+          Rd_size, Rd,
+          il.Add(Rd_size, il.Register(Rn_size, Rn), il.Const(Rd_size, 1))));
+      return true;
+    }
 
-	bool LiftCINC(cs_insn* instr, LowLevelILFunction& il) {
-        cs_arm64* detail = &(instr->detail->arm64);
+    LowLevelILLabel incrementLabel, assignmentLabel, afterLabel;
 
-        // FIXME(keegan) ensure 64-bit-64-bit or 32-bit-32-bit
-        uint32_t Rd = this->m_base->GetRegisterByName(cs_reg_name(capstone_, detail->operands[0].reg));
-        uint32_t Rn = this->m_base->GetRegisterByName(cs_reg_name(capstone_, detail->operands[1].reg));
+    il.AddInstruction(il.If(il.FlagCondition(LiftCondition(detail->cc)),
+                            incrementLabel, assignmentLabel));
 
-        size_t Rd_size = this->m_base->GetRegisterInfo(Rd).size;
-        size_t Rn_size = this->m_base->GetRegisterInfo(Rn).size;
+    // Rd = Rn + 1
+    il.MarkLabel(incrementLabel);
+    il.AddInstruction(il.SetRegister(
+        Rd_size, Rd,
+        il.Add(Rd_size, il.Register(Rn_size, Rn), il.Const(Rd_size, 1))));
+    il.AddInstruction(il.Goto(afterLabel));
 
-        if (detail->cc == ARM64_CC_INVALID) {
-            return false;
-        }
+    // Rd = Rn
+    il.MarkLabel(assignmentLabel);
+    il.AddInstruction(il.SetRegister(Rd_size, Rd, il.Register(Rn_size, Rn)));
 
-        if (detail->cc == ARM64_CC_AL || detail->cc == ARM64_CC_NV) {
-            // Rd = Rn + 1
-            il.AddInstruction(
-                    il.SetRegister(Rd_size,
-                            Rd,
-                            il.Add(Rd_size,il.Register(Rn_size, Rn),il.Const(Rd_size, 1))));
-            return true;
-        }
+    il.MarkLabel(afterLabel);
 
-        LowLevelILLabel increment_label;
-        LowLevelILLabel assignment_label;
-        LowLevelILLabel after_label;
+    return true;
+  }
 
-        il.AddInstruction(il.If(il.FlagCondition(LiftCondition(detail->cc)), increment_label, assignment_label));
+  bool LiftBFI(cs_insn* instr, LowLevelILFunction& il) {
+    cs_arm64* detail = &(instr->detail->arm64);
 
-        // Rd = Rn + 1
-        il.MarkLabel(increment_label);
-        il.AddInstruction(
-                il.SetRegister(Rd_size,
-                               Rd,
-                               il.Add(Rd_size,il.Register(Rn_size, Rn),il.Const(Rd_size, 1))));
-        il.AddInstruction(il.Goto(after_label));
+    if (detail->op_count != 4) {
+      return false;
+    }
 
-        // Rd = Rn
-        il.MarkLabel(assignment_label);
-        il.AddInstruction(il.SetRegister(Rd_size, Rd, il.Register(Rn_size, Rn)));
+    uint32_t Rd = this->m_base->GetRegisterByName(
+        cs_reg_name(mCapstone, detail->operands[0].reg));
+    uint32_t Rn = this->m_base->GetRegisterByName(
+        cs_reg_name(mCapstone, detail->operands[1].reg));
+    size_t Rd_size = this->m_base->GetRegisterInfo(Rd).size;
+    size_t Rn_size = this->m_base->GetRegisterInfo(Rd).size;
+    int64_t lsb = detail->operands[2].imm;
+    int64_t width = detail->operands[3].imm;
 
-        il.MarkLabel(after_label);
+    // Continue if the both are same size and either 32-bit or 64-bit
+    if (Rd_size != Rn_size && !(Rd_size == 4 ^ Rd_size == 8)) {
+      return false;
+    }
 
-	    return true;
-	}
+    uint64_t inclusion_mask;
+    if (Rd_size == 8) {
+      inclusion_mask = Ones<uint64_t>(width) << lsb;
+    } else {
+      inclusion_mask = Ones<uint32_t>(width) << lsb;
+    }
 
-	bool GetInstructionLowLevelIL(const uint8_t* data, uint64_t addr, size_t& len, LowLevelILFunction& il) override {
-        cs_insn* instr;
-	    size_t count = cs_disasm(capstone_, data, len, addr, 0, &instr);
+    ExprId left = il.And(Rd_size, il.Register(Rd_size, Rd),
+                         il.Const(Rd_size, ~inclusion_mask));
+    ExprId right = il.And(
+        Rd_size,
+        il.ShiftLeft(Rd_size, il.Register(Rd_size, Rn), il.Const(1, lsb)),
+        il.Const(Rd_size, inclusion_mask));
+    il.AddInstruction(il.SetRegister(Rd_size, Rd, il.Or(Rd_size, left, right)));
 
-        bool supported = false;
-	    if (count == 1) {
-            switch (instr->id) {
-            case ARM64_INS_CSINC:
-//                LogInfo("CSINC @ 0x%lx", addr);
-                supported = LiftCSINC(instr, il);
-                break;
-            case ARM64_INS_UMULL:
-//                LogInfo("UMULL @ 0x%lx", addr);
-                supported = LiftUMULL(instr, il);
-                break;
-            case ARM64_INS_CINC:
-//                LogInfo("CINC @ 0x%lx", addr);
-                supported = LiftCINC(instr, il);
-                break;
-            }
-        }
+    return true;
+  }
 
-	    /*
-	     * >>> for basic_block in current_llil:
-...     for instr in basic_block:
-...         if instr.operation == LowLevelILOperation.LLIL_UNIMPL:
-...             print(bv.get_disassembly(instr.address))
-	     *
-	     * */
-	    // CSETM
-	    // MNEG
-	    // BFI
+  bool GetInstructionLowLevelIL(const uint8_t* data, uint64_t addr, size_t& len,
+                                LowLevelILFunction& il) override {
+    cs_insn* instr;
+    size_t count = cs_disasm(mCapstone, data, len, addr, 0, &instr);
 
-	    // EOR with ASR
-	    // ORN with ASR
-	    // AND with ASR
-	    // Anything with ASR?
+    bool supported = false;
+    if (count > 0) {
+      switch (instr->id) {
+      case ARM64_INS_CSINC:
+#ifdef AARCH64_TRACE_INSTR
+        LogInfo("CSINC @ 0x%lx", instr->address);
+#endif
+        supported = LiftCSINC(instr, il);
+        break;
+      case ARM64_INS_UMULL:
+#ifdef AARCH64_TRACE_INSTR
+        LogInfo("UMULL @ 0x%lx", instr->address);
+#endif
+        supported = LiftUMULL(instr, il);
+        break;
+      case ARM64_INS_CINC:
+#ifdef AARCH64_TRACE_INSTR
+        LogInfo("CINC @ 0x%lx", instr->address);
+#endif
+        supported = LiftCINC(instr, il);
+        break;
+      case ARM64_INS_BFI:
+#ifdef AARCH64_TRACE_INSTR
+        LogInfo("BFI @ 0x%lx", instr->address);
+#endif
+        supported = LiftBFI(instr, il);
+        break;
+      }
+    }
 
-	    // ROR reg, reg, imm
-	    // ADDS reg, reg, imm
+    len = instr->size;
+    if (count > 0) {
+      cs_free(instr, count);
+    }
 
-	    // MRS & friends should be lifted as an intrinsic
+    if (!supported) {
+      return ArchitectureHook::GetInstructionLowLevelIL(data, addr, len, il);
+    }
 
-	    // These are unimplemented?
-	    // ldr q0, [x1]
-	    // str q0, [x0]
-
-	    len = instr->size;
-        cs_free(instr, count);
-
-        if (!supported) {
-            return ArchitectureHook::GetInstructionLowLevelIL(data, addr, len, il);
-        }
-
-        return true;
-	}
+    return true;
+  }
 };
 
 extern "C" {
-	BINARYNINJAPLUGIN void CorePluginDependencies() {
-		AddRequiredPluginDependency("arch_arm64");
-	}
+BINARYNINJAPLUGIN void CorePluginDependencies() {
+  AddRequiredPluginDependency("arch_arm64");
+}
 
-	BINARYNINJAPLUGIN bool CorePluginInit() {
-        LogInfo("Registered AArch64 extensions plugin");
-		Architecture* aarch64Ext = new AArch64ArchitectureExtension(Architecture::GetByName("aarch64"));
-		Architecture::Register(aarch64Ext);
-		return true;
-	}
+BINARYNINJAPLUGIN bool CorePluginInit() {
+  LogInfo("Registered AArch64 extensions plugin");
+  Architecture* aarch64Ext =
+      new AArch64ArchitectureExtension(Architecture::GetByName("aarch64"));
+  Architecture::Register(aarch64Ext);
+  return true;
+}
 }
