@@ -233,6 +233,48 @@ public:
     return true;
   }
 
+  bool LiftROR(cs_insn* instr, LowLevelILFunction& il) {
+    // 00003edc
+    cs_arm64* detail = &(instr->detail->arm64);
+
+    if (detail->op_count != 3) {
+      return false;
+    }
+
+    uint32_t Rd = this->m_base->GetRegisterByName(
+        cs_reg_name(mCapstone, detail->operands[0].reg));
+    uint32_t Rn = this->m_base->GetRegisterByName(
+        cs_reg_name(mCapstone, detail->operands[1].reg));
+
+    size_t Rd_size = this->m_base->GetRegisterInfo(Rd).size;
+    size_t Rn_size = this->m_base->GetRegisterInfo(Rd).size;
+
+    if (Rd_size != Rn_size) {
+      return false;
+    }
+
+    if (detail->operands[2].type == ARM64_OP_REG) {
+      uint32_t Rm = this->m_base->GetRegisterByName(
+          cs_reg_name(mCapstone, detail->operands[2].reg));
+
+      il.AddInstruction(
+          il.SetRegister(Rd_size, Rd,
+                         il.RotateRight(Rd_size, il.Register(Rd_size, Rn),
+                                        il.Register(Rd_size, Rm))));
+      return true;
+    } else if (detail->operands[2].type == ARM64_OP_IMM) {
+      uint32_t shift = detail->operands[2].imm;
+
+      il.AddInstruction(
+          il.SetRegister(Rd_size, Rd,
+                         il.RotateRight(Rd_size, il.Register(Rd_size, Rn),
+                                        il.Const(Rd_size, shift))));
+      return true;
+    }
+
+    return false;
+  }
+
   bool GetInstructionLowLevelIL(const uint8_t* data, uint64_t addr, size_t& len,
                                 LowLevelILFunction& il) override {
     cs_insn* instr;
@@ -264,6 +306,12 @@ public:
         LogInfo("BFI @ 0x%lx", instr->address);
 #endif
         supported = LiftBFI(instr, il);
+        break;
+      case ARM64_INS_ROR:
+#ifdef AARCH64_TRACE_INSTR
+        LogInfo("ROR @ 0x%lx", instr->address);
+#endif
+        supported = LiftROR(instr, il);
         break;
       }
     }
