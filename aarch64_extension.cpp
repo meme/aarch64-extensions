@@ -46,10 +46,10 @@ public:
 static thread_local Disassembler disassembler;
 
 class AArch64ArchitectureExtension : public ArchitectureHook {
+private:
   std::map<uint32_t, NameAndType> mIntrinsics;
   std::map<const char*, uint32_t> mIntrinsicNames;
 
-private:
   /**
    * Convert a Capstone condition code to BNIL condition code
    *
@@ -102,55 +102,28 @@ public:
       : ArchitectureHook(aarch64) {
     std::vector<uint32_t> intrinsics = this->m_base->GetAllIntrinsics();
     uint32_t intrinsic = 0;
-    if (intrinsics.size() > 0) {
+    if (!intrinsics.empty()) {
       intrinsic = 1 + *max_element(intrinsics.begin(), intrinsics.end());
     }
 
-    /*
-     * Declare new architecture intrinsics
-     */
-
+    // Declare new architecture intrinsics (MRS/MSR)
     mIntrinsicNames["__builtin_mrs"] = intrinsic;
     mIntrinsics[intrinsic++] = NameAndType(
         "__builtin_mrs",
         Type::FunctionType(
-            Confidence<Ref<Type>>(
-                Type::IntegerType(8, Confidence<bool>(true), "")), /* return */
-            Confidence<Ref<CallingConvention>>(
-                this->m_base
-                    ->GetDefaultCallingConvention()), /* calling convention */
-            std::vector<FunctionParameter>{FunctionParameter{
-                /* arg1 */
-                "reg",
-                Confidence<Ref<Type>>(
-                    Type::IntegerType(8, Confidence<bool>(true), "")),
-                true, Variable()}},   /* args */
-            Confidence<bool>(false),  /* varArg */
-            Confidence<int64_t>(0))); /* stackAdjust */
+            Type::IntegerType(8, true, ""),
+            this->m_base->GetDefaultCallingConvention(),
+            {{"reg", Type::IntegerType(8, true, ""), true, Variable()}}, false,
+            0));
 
     mIntrinsicNames["__builtin_msr"] = intrinsic;
     mIntrinsics[intrinsic++] = NameAndType(
         "__builtin_msr",
         Type::FunctionType(
-            Confidence<Ref<Type>>(Type::VoidType()), /* return */
-            Confidence<Ref<CallingConvention>>(
-                this->m_base
-                    ->GetDefaultCallingConvention()), /* calling convention */
-            std::vector<FunctionParameter>{
-                FunctionParameter{/* arg1 */
-                                  "reg",
-                                  Confidence<Ref<Type>>(Type::IntegerType(
-                                      8, Confidence<bool>(true), "")),
-                                  true, Variable()},
-                FunctionParameter{
-                    /* arg2 */
-                    "val",
-                    Confidence<Ref<Type>>(
-                        Type::IntegerType(8, Confidence<bool>(true), "")),
-                    true, Variable() /* arg2 */
-                }},
-            Confidence<bool>(false),  /* varArg */
-            Confidence<int64_t>(0))); /* stackAdjust */
+            Type::VoidType(), this->m_base->GetDefaultCallingConvention(),
+            {{"reg", Type::IntegerType(8, true, ""), true, Variable()},
+             {"val", Type::IntegerType(8, true, ""), true, Variable()}},
+            false, 0));
   }
 
   bool LiftCSINC(cs_insn* instr, LowLevelILFunction& il) {
@@ -402,12 +375,10 @@ public:
       return false;
     }
 
-    il.AddInstruction(
-        il.Intrinsic(std::vector<RegisterOrFlag>{RegisterOrFlag(false, Rd)},
-                     mIntrinsicNames["__builtin_mrs"],
-                     std::vector<ExprId>{il.Const(
-                         Rn_size, Rn, ILSourceLocation(instr->address, 1))},
-                     0, ILSourceLocation(instr->address, 0)));
+    il.AddInstruction(il.Intrinsic(
+        {RegisterOrFlag(false, Rd)}, mIntrinsicNames["__builtin_mrs"],
+        {il.Const(Rn_size, Rn, ILSourceLocation(instr->address, 1))}, 0,
+        ILSourceLocation(instr->address, 0)));
 
     return true;
   }
@@ -450,10 +421,8 @@ public:
     }
 
     il.AddInstruction(il.Intrinsic(
-        std::vector<RegisterOrFlag>{}, mIntrinsicNames["__builtin_msr"],
-        std::vector<ExprId>{
-            il.Const(Rd_size, Rd, ILSourceLocation(instr->address, 0)),
-            srcExpr},
+        {}, mIntrinsicNames["__builtin_msr"],
+        {il.Const(Rd_size, Rd, ILSourceLocation(instr->address, 0)), srcExpr},
         0, ILSourceLocation(instr->address, 0)));
 
     return true;
@@ -531,16 +500,15 @@ public:
   }
 
   string GetIntrinsicName(uint32_t intrinsic) override {
-    std::map<uint32_t, NameAndType>::iterator it = mIntrinsics.find(intrinsic);
-    if (it == mIntrinsics.end()) {
+    if (mIntrinsics.find(intrinsic) == mIntrinsics.end()) {
       return ArchitectureHook::GetIntrinsicName(intrinsic);
     } else {
-      return it->second.name;
+      return mIntrinsics[intrinsic].name;
     }
   }
 
   std::vector<uint32_t> GetAllIntrinsics() override {
-    std::vector<uint32_t> base = ArchitectureHook::GetAllIntrinsics();
+    auto base = ArchitectureHook::GetAllIntrinsics();
 
     for (auto& instr : mIntrinsics) {
       base.push_back(instr.first);
@@ -550,18 +518,17 @@ public:
   }
 
   std::vector<NameAndType> GetIntrinsicInputs(uint32_t intrinsic) override {
-    std::map<uint32_t, NameAndType>::iterator it = mIntrinsics.find(intrinsic);
-    if (it == mIntrinsics.end()) {
+    if (mIntrinsics.find(intrinsic) == mIntrinsics.end()) {
       return ArchitectureHook::GetIntrinsicInputs(intrinsic);
     } else {
       std::vector<FunctionParameter> parms =
-          it->second.type.GetValue()->GetParameters();
+          mIntrinsics[intrinsic].type.GetValue()->GetParameters();
       std::vector<NameAndType> inputs;
 
       inputs.reserve(parms.size());
 
       for (auto& parm : parms) {
-        inputs.push_back(NameAndType(parm.name, parm.type));
+        inputs.emplace_back(parm.name, parm.type);
       }
 
       return inputs;
@@ -570,16 +537,15 @@ public:
 
   std::vector<Confidence<Ref<Type>>>
   GetIntrinsicOutputs(uint32_t intrinsic) override {
-    std::map<uint32_t, NameAndType>::iterator it = mIntrinsics.find(intrinsic);
-    if (it == mIntrinsics.end()) {
+    if (mIntrinsics.find(intrinsic) == mIntrinsics.end()) {
       return ArchitectureHook::GetIntrinsicOutputs(intrinsic);
     } else {
       Confidence<Ref<Type>> retType =
-          it->second.type.GetValue()->GetChildType();
+          mIntrinsics[intrinsic].type.GetValue()->GetChildType();
       if (retType.GetValue() == Type::VoidType()) {
-        return std::vector<Confidence<Ref<Type>>>{};
+        return {};
       } else {
-        return std::vector<Confidence<Ref<Type>>>{retType};
+        return {retType};
       }
     }
   }
