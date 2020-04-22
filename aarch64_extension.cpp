@@ -1,7 +1,10 @@
+#include <algorithm>
 #include <binaryninjaapi.h>
 #include <capstone/capstone.h>
+#include <lowlevelilinstruction.h>
 
 using namespace BinaryNinja;
+using string = std::string;
 
 // #define AARCH64_TRACE_INSTR
 
@@ -16,8 +19,9 @@ template <typename T> inline T Ones(size_t count) {
 
 class Disassembler {
 private:
-  csh mCapstone {};
+  csh mCapstone{};
   bool mIsOK = true;
+
 public:
   Disassembler() noexcept {
     if (cs_open(CS_ARCH_ARM64, CS_MODE_ARM, &mCapstone) != CS_ERR_OK) {
@@ -28,26 +32,24 @@ public:
     cs_option(mCapstone, CS_OPT_DETAIL, CS_OPT_ON);
   }
 
-  ~Disassembler() {
-    cs_close(&mCapstone);
-  }
+  ~Disassembler() { cs_close(&mCapstone); }
 
-  bool IsOK() const {
-    return mIsOK;
-  }
+  bool IsOK() const { return mIsOK; }
 
-  csh Get() const {
-    return mCapstone;
-  }
+  csh Get() const { return mCapstone; }
 };
 
-// Disassembler _must_ be thread_local because on multi-threaded analysis GetInstructionLowLevelIL may be called
-// from multiple threads, thus causing Capstone to malfunction. Note that on thread exit the destructor will
-// be called and the associated Capstone resources will be released
+// Disassembler _must_ be thread_local because on multi-threaded analysis
+// GetInstructionLowLevelIL may be called from multiple threads, thus causing
+// Capstone to malfunction. Note that on thread exit the destructor will be
+// called and the associated Capstone resources will be released
 static thread_local Disassembler disassembler;
 
 class AArch64ArchitectureExtension : public ArchitectureHook {
 private:
+  std::map<uint32_t, NameAndType> mIntrinsics;
+  std::map<const char*, uint32_t> mIntrinsicNames;
+
   /**
    * Convert a Capstone condition code to BNIL condition code
    *
@@ -98,6 +100,30 @@ private:
 public:
   explicit AArch64ArchitectureExtension(Architecture* aarch64)
       : ArchitectureHook(aarch64) {
+    std::vector<uint32_t> intrinsics = this->m_base->GetAllIntrinsics();
+    uint32_t intrinsic = 0;
+    if (!intrinsics.empty()) {
+      intrinsic = 1 + *max_element(intrinsics.begin(), intrinsics.end());
+    }
+
+    // Declare new architecture intrinsics (MRS/MSR)
+    mIntrinsicNames["__builtin_mrs"] = intrinsic;
+    mIntrinsics[intrinsic++] = NameAndType(
+        "__builtin_mrs",
+        Type::FunctionType(
+            Type::IntegerType(8, true, ""),
+            this->m_base->GetDefaultCallingConvention(),
+            {{"reg", Type::IntegerType(8, true, ""), true, Variable()}}, false,
+            0));
+
+    mIntrinsicNames["__builtin_msr"] = intrinsic;
+    mIntrinsics[intrinsic++] = NameAndType(
+        "__builtin_msr",
+        Type::FunctionType(
+            Type::VoidType(), this->m_base->GetDefaultCallingConvention(),
+            {{"reg", Type::IntegerType(8, true, ""), true, Variable()},
+             {"val", Type::IntegerType(8, true, ""), true, Variable()}},
+            false, 0));
   }
 
   bool LiftCSINC(cs_insn* instr, LowLevelILFunction& il) {
@@ -229,7 +255,7 @@ public:
     uint32_t Rn = this->m_base->GetRegisterByName(
         cs_reg_name(disassembler.Get(), detail->operands[1].reg));
     size_t Rd_size = this->m_base->GetRegisterInfo(Rd).size;
-    size_t Rn_size = this->m_base->GetRegisterInfo(Rd).size;
+    size_t Rn_size = this->m_base->GetRegisterInfo(Rn).size;
     int64_t lsb = detail->operands[2].imm;
     int64_t width = detail->operands[3].imm;
 
@@ -269,7 +295,7 @@ public:
         cs_reg_name(disassembler.Get(), detail->operands[1].reg));
 
     size_t Rd_size = this->m_base->GetRegisterInfo(Rd).size;
-    size_t Rn_size = this->m_base->GetRegisterInfo(Rd).size;
+    size_t Rn_size = this->m_base->GetRegisterInfo(Rn).size;
 
     if (Rd_size != Rn_size) {
       return false;
@@ -295,6 +321,172 @@ public:
     }
 
     return false;
+  }
+
+  bool LiftFMOV(cs_insn* instr, LowLevelILFunction& il) {
+    cs_arm64* detail = &(instr->detail->arm64);
+
+    if (detail->op_count != 2) {
+      return false;
+    }
+
+    if (detail->operands[0].type == ARM64_OP_REG &&
+        detail->operands[1].type == ARM64_OP_FP) {
+      uint32_t Rd = this->m_base->GetRegisterByName(
+          cs_reg_name(disassembler.Get(), detail->operands[0].reg));
+      size_t Rd_size = this->m_base->GetRegisterInfo(Rd).size;
+
+      double rhsConst = detail->operands[1].fp;
+
+      if (16 == Rd_size) {
+        /*
+         * FMOV (vector, immediate) not supported
+         */
+        return false;
+      } else if (Rd_size <= 8) {
+        /*
+         * FMOV (scalar, immediate)
+         */
+        il.AddInstruction(
+            il.SetRegister(Rd_size, Rd,
+                           il.FloatConstDouble(
+                               rhsConst, ILSourceLocation(instr->address, 1))));
+        return true;
+      } else {
+        return false;
+      }
+    } else if (detail->operands[0].type == ARM64_OP_REG &&
+               detail->operands[1].type == ARM64_OP_REG) {
+      uint32_t Rd = this->m_base->GetRegisterByName(
+          cs_reg_name(disassembler.Get(), detail->operands[0].reg));
+      uint32_t Rn = this->m_base->GetRegisterByName(
+          cs_reg_name(disassembler.Get(), detail->operands[1].reg));
+
+      size_t Rd_size = this->m_base->GetRegisterInfo(Rd).size;
+      size_t Rn_size = this->m_base->GetRegisterInfo(Rn).size;
+
+      if (-1 == detail->operands[0].vector_index &&
+          1 == detail->operands[1].vector_index && 8 == Rd_size &&
+          16 == Rn_size) {
+        /* FMOV <Xn>, <Vd>.D[1] */
+        il.AddInstruction(il.SetRegister(
+            Rd_size, Rd,
+            il.LowPart(Rd_size,
+                       il.LogicalShiftRight(Rn_size, il.Register(Rn_size, Rn),
+                                            il.Const(1, 64)))));
+        return true;
+      } else if (1 == detail->operands[0].vector_index &&
+                 -1 == detail->operands[1].vector_index && 16 == Rd_size &&
+                 8 == Rn_size) {
+        /* FMOV <Vd>.D[1], <Xn> */
+        il.AddInstruction(il.SetRegister(
+            Rd_size, Rd,
+            il.ZeroExtend(Rd_size, il.Or(Rn_size, il.Register(Rn_size, Rn),
+                                         il.Register(Rn_size, Rd)))));
+        return true;
+      } else if (-1 == detail->operands[0].vector_index &&
+                 -1 == detail->operands[1].vector_index) {
+        if (Rd_size != Rn_size && 2 != Rd_size && 2 != Rn_size) {
+          return false;
+        }
+
+        ExprId rhs;
+
+        if (Rd_size > Rn_size) {
+          /* FMOV (general, extend) */
+          rhs = il.ZeroExtend(Rd_size, il.Register(Rn_size, Rn));
+        } else if (Rd_size < Rn_size) {
+          /* FMOV (general, truncate) */
+          rhs = il.Register(Rd_size, Rn);
+        } else {
+          /* FMOV (general, same size) */
+          rhs = il.Register(Rn_size, Rn);
+        }
+
+        il.AddInstruction(il.SetRegister(Rd_size, Rd, rhs));
+        return true;
+      } else {
+        return false;
+      }
+    } else {
+      return false;
+    }
+  }
+
+  bool LiftMRS(cs_insn* instr, LowLevelILFunction& il) {
+    cs_arm64* detail = &(instr->detail->arm64);
+
+    if (detail->op_count != 2) {
+      return false;
+    }
+
+    if (detail->operands[0].type != ARM64_OP_REG ||
+        detail->operands[1].type != ARM64_OP_REG_MRS) {
+      return false;
+    }
+
+    uint32_t Rd = this->m_base->GetRegisterByName(
+        cs_reg_name(disassembler.Get(), detail->operands[0].reg));
+    uint32_t Rn = detail->operands[1].reg;
+
+    size_t Rd_size = this->m_base->GetRegisterInfo(Rd).size;
+    size_t Rn_size = 8;
+
+    if (Rd_size != Rn_size) {
+      return false;
+    }
+
+    il.AddInstruction(il.Intrinsic(
+        {RegisterOrFlag(false, Rd)}, mIntrinsicNames["__builtin_mrs"],
+        {il.Const(Rn_size, Rn, ILSourceLocation(instr->address, 1))}, 0,
+        ILSourceLocation(instr->address, 0)));
+
+    return true;
+  }
+
+  bool LiftMSR(cs_insn* instr, LowLevelILFunction& il) {
+    cs_arm64* detail = &(instr->detail->arm64);
+
+    if (detail->op_count != 2) {
+      return false;
+    }
+
+    if (detail->operands[0].type != ARM64_OP_REG_MSR) {
+      return false;
+    }
+
+    uint32_t Rd = detail->operands[0].reg;
+    const size_t Rd_size = 8;
+
+    ExprId srcExpr;
+
+    switch (detail->operands[1].type) {
+    case ARM64_OP_REG_MSR: {
+      uint32_t Rn = this->m_base->GetRegisterByName(
+          cs_reg_name(disassembler.Get(), detail->operands[1].reg));
+
+      size_t Rn_size = this->m_base->GetRegisterInfo(Rn).size;
+
+      if (Rd_size != Rn_size) {
+        return false;
+      }
+
+      srcExpr = il.Register(Rn_size, Rn);
+    } break;
+    case ARM64_OP_IMM:
+      srcExpr = il.Const(Rd_size, detail->operands[0].imm,
+                         ILSourceLocation(instr->address, 1));
+      break;
+    default:
+      return false;
+    }
+
+    il.AddInstruction(il.Intrinsic(
+        {}, mIntrinsicNames["__builtin_msr"],
+        {il.Const(Rd_size, Rd, ILSourceLocation(instr->address, 0)), srcExpr},
+        0, ILSourceLocation(instr->address, 0)));
+
+    return true;
   }
 
   bool GetInstructionLowLevelIL(const uint8_t* data, uint64_t addr, size_t& len,
@@ -335,11 +527,29 @@ public:
 #endif
         supported = LiftROR(instr, il);
         break;
+      case ARM64_INS_FMOV:
+#ifdef AARCH64_TRACE_INSTR
+        LogInfo("FMOV @ 0x%lx", instr->address);
+#endif
+        supported = LiftFMOV(instr, il);
+        break;
+      case ARM64_INS_MRS:
+#ifdef AARCH64_TRACE_INSTR
+        LogInfo("MRS @ 0x%lx", instr->address);
+#endif
+        supported = LiftMRS(instr, il);
+        break;
+      case ARM64_INS_MSR:
+#ifdef AARCH64_TRACE_INSTR
+        LogInfo("MSR @ 0x%lx", instr->address);
+#endif
+        supported = LiftMSR(instr, il);
+        break;
       }
     }
 
-    len = instr->size;
     if (count > 0) {
+      len = instr->size;
       cs_free(instr, count);
     }
 
@@ -348,6 +558,57 @@ public:
     }
 
     return true;
+  }
+
+  string GetIntrinsicName(uint32_t intrinsic) override {
+    if (mIntrinsics.find(intrinsic) == mIntrinsics.end()) {
+      return ArchitectureHook::GetIntrinsicName(intrinsic);
+    } else {
+      return mIntrinsics[intrinsic].name;
+    }
+  }
+
+  std::vector<uint32_t> GetAllIntrinsics() override {
+    auto base = ArchitectureHook::GetAllIntrinsics();
+
+    for (auto& instr : mIntrinsics) {
+      base.push_back(instr.first);
+    }
+
+    return base;
+  }
+
+  std::vector<NameAndType> GetIntrinsicInputs(uint32_t intrinsic) override {
+    if (mIntrinsics.find(intrinsic) == mIntrinsics.end()) {
+      return ArchitectureHook::GetIntrinsicInputs(intrinsic);
+    } else {
+      std::vector<FunctionParameter> parms =
+          mIntrinsics[intrinsic].type.GetValue()->GetParameters();
+      std::vector<NameAndType> inputs;
+
+      inputs.reserve(parms.size());
+
+      for (auto& parm : parms) {
+        inputs.emplace_back(parm.name, parm.type);
+      }
+
+      return inputs;
+    }
+  }
+
+  std::vector<Confidence<Ref<Type>>>
+  GetIntrinsicOutputs(uint32_t intrinsic) override {
+    if (mIntrinsics.find(intrinsic) == mIntrinsics.end()) {
+      return ArchitectureHook::GetIntrinsicOutputs(intrinsic);
+    } else {
+      Confidence<Ref<Type>> retType =
+          mIntrinsics[intrinsic].type.GetValue()->GetChildType();
+      if (retType.GetValue() == Type::VoidType()) {
+        return {};
+      } else {
+        return {retType};
+      }
+    }
   }
 };
 
