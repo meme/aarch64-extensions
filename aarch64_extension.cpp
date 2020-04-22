@@ -255,7 +255,7 @@ public:
     uint32_t Rn = this->m_base->GetRegisterByName(
         cs_reg_name(disassembler.Get(), detail->operands[1].reg));
     size_t Rd_size = this->m_base->GetRegisterInfo(Rd).size;
-    size_t Rn_size = this->m_base->GetRegisterInfo(Rd).size;
+    size_t Rn_size = this->m_base->GetRegisterInfo(Rn).size;
     int64_t lsb = detail->operands[2].imm;
     int64_t width = detail->operands[3].imm;
 
@@ -295,7 +295,7 @@ public:
         cs_reg_name(disassembler.Get(), detail->operands[1].reg));
 
     size_t Rd_size = this->m_base->GetRegisterInfo(Rd).size;
-    size_t Rn_size = this->m_base->GetRegisterInfo(Rd).size;
+    size_t Rn_size = this->m_base->GetRegisterInfo(Rn).size;
 
     if (Rd_size != Rn_size) {
       return false;
@@ -330,26 +330,87 @@ public:
       return false;
     }
 
-    if (detail->operands[0].type != ARM64_OP_REG ||
-        detail->operands[1].type != ARM64_OP_REG) {
+    if (detail->operands[0].type == ARM64_OP_REG &&
+        detail->operands[1].type == ARM64_OP_FP) {
+      uint32_t Rd = this->m_base->GetRegisterByName(
+          cs_reg_name(disassembler.Get(), detail->operands[0].reg));
+      size_t Rd_size = this->m_base->GetRegisterInfo(Rd).size;
+
+      double rhsConst = detail->operands[1].fp;
+
+      if (16 == Rd_size) {
+        /*
+         * FMOV (vector, immediate) not supported
+         */
+        return false;
+      } else if (Rd_size <= 8) {
+        /*
+         * FMOV (scalar, immediate)
+         */
+        il.AddInstruction(
+            il.SetRegister(Rd_size, Rd,
+                           il.FloatConstDouble(
+                               rhsConst, ILSourceLocation(instr->address, 1))));
+        return true;
+      } else {
+        return false;
+      }
+    } else if (detail->operands[0].type == ARM64_OP_REG &&
+               detail->operands[1].type == ARM64_OP_REG) {
+      uint32_t Rd = this->m_base->GetRegisterByName(
+          cs_reg_name(disassembler.Get(), detail->operands[0].reg));
+      uint32_t Rn = this->m_base->GetRegisterByName(
+          cs_reg_name(disassembler.Get(), detail->operands[1].reg));
+
+      size_t Rd_size = this->m_base->GetRegisterInfo(Rd).size;
+      size_t Rn_size = this->m_base->GetRegisterInfo(Rn).size;
+
+      if (-1 == detail->operands[0].vector_index &&
+          1 == detail->operands[1].vector_index && 8 == Rd_size &&
+          16 == Rn_size) {
+        /* FMOV <Xn>, <Vd>.D[1] */
+        il.AddInstruction(il.SetRegister(
+            Rd_size, Rd,
+            il.LowPart(Rd_size,
+                       il.LogicalShiftRight(Rn_size, il.Register(Rn_size, Rn),
+                                            il.Const(1, 64)))));
+        return true;
+      } else if (1 == detail->operands[0].vector_index &&
+                 -1 == detail->operands[1].vector_index && 16 == Rd_size &&
+                 8 == Rn_size) {
+        /* FMOV <Vd>.D[1], <Xn> */
+        il.AddInstruction(il.SetRegister(
+            Rd_size, Rd,
+            il.ZeroExtend(Rd_size, il.Or(Rn_size, il.Register(Rn_size, Rn),
+                                         il.Register(Rn_size, Rd)))));
+        return true;
+      } else if (-1 == detail->operands[0].vector_index &&
+                 -1 == detail->operands[1].vector_index) {
+        if (Rd_size != Rn_size && 2 != Rd_size && 2 != Rn_size) {
+          return false;
+        }
+
+        ExprId rhs;
+
+        if (Rd_size > Rn_size) {
+          /* FMOV (general, extend) */
+          rhs = il.ZeroExtend(Rd_size, il.Register(Rn_size, Rn));
+        } else if (Rd_size < Rn_size) {
+          /* FMOV (general, truncate) */
+          rhs = il.Register(Rd_size, Rn);
+        } else {
+          /* FMOV (general, same size) */
+          rhs = il.Register(Rn_size, Rn);
+        }
+
+        il.AddInstruction(il.SetRegister(Rd_size, Rd, rhs));
+        return true;
+      } else {
+        return false;
+      }
+    } else {
       return false;
     }
-
-    uint32_t Rd = this->m_base->GetRegisterByName(
-        cs_reg_name(disassembler.Get(), detail->operands[0].reg));
-    uint32_t Rn = this->m_base->GetRegisterByName(
-        cs_reg_name(disassembler.Get(), detail->operands[1].reg));
-
-    size_t Rd_size = this->m_base->GetRegisterInfo(Rd).size;
-    size_t Rn_size = this->m_base->GetRegisterInfo(Rd).size;
-
-    if (Rd_size != Rn_size) {
-      return false;
-    }
-
-    il.AddInstruction(il.SetRegister(Rd_size, Rd, il.Register(Rd_size, Rn)));
-
-    return true;
   }
 
   bool LiftMRS(cs_insn* instr, LowLevelILFunction& il) {
