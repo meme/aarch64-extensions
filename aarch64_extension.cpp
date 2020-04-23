@@ -1,12 +1,18 @@
 #include <algorithm>
+#include <assert.h>
 #include <binaryninjaapi.h>
 #include <capstone/capstone.h>
+#include <errno.h>
 #include <lowlevelilinstruction.h>
+#include <string.h>
 
 using namespace BinaryNinja;
 using string = std::string;
 
 // #define AARCH64_TRACE_INSTR
+// #define CAPSTONE_NEXT
+
+#define AARCH64_MAX_INSN_SIZE (4)
 
 // Returns 1s expanded to count, e.g.: Count<uint8_t>(7) == 0b01111111
 template <typename T> inline T Ones(size_t count) {
@@ -45,10 +51,35 @@ public:
 // called and the associated Capstone resources will be released
 static thread_local Disassembler disassembler;
 
+struct vector_access {
+  char elemType;
+  size_t elemSize;
+  size_t vectorIndex;
+};
+
+/*
+ * Vector arrangement forms used to generate BinaryNinja subregisters
+ */
+const struct vector_access regForms[] = {
+    {'d', 8, 0},  {'d', 8, 1},
+
+    {'s', 4, 0},  {'s', 4, 1},  {'s', 4, 2},  {'s', 4, 3},
+
+    {'h', 2, 0},  {'h', 2, 1},  {'h', 2, 2},  {'h', 2, 3},
+    {'h', 2, 4},  {'h', 2, 5},  {'h', 2, 6},  {'h', 2, 7},
+
+    {'b', 1, 0},  {'b', 1, 1},  {'b', 1, 2},  {'b', 1, 3},
+    {'b', 1, 4},  {'b', 1, 5},  {'b', 1, 6},  {'b', 1, 7},
+    {'b', 1, 8},  {'b', 1, 9},  {'b', 1, 10}, {'b', 1, 11},
+    {'b', 1, 12}, {'b', 1, 13}, {'b', 1, 14}, {'b', 1, 15}};
+
 class AArch64ArchitectureExtension : public ArchitectureHook {
 private:
   std::map<uint32_t, NameAndType> mIntrinsics;
   std::map<const char*, uint32_t> mIntrinsicNames;
+
+  std::map<uint32_t, std::pair<string, BNRegisterInfo>> mRegisters;
+  std::map<string, uint32_t> mRegisterNames;
 
   /**
    * Convert a Capstone condition code to BNIL condition code
@@ -97,9 +128,28 @@ private:
     return (BNLowLevelILFlagCondition) -1;
   }
 
+  uint32_t getVectorSubregister(uint32_t baseRegister, size_t elemSize,
+                                size_t index) {
+    for (auto& regPair : mRegisters) {
+      uint32_t id = regPair.first;
+      BNRegisterInfo reg = regPair.second.second;
+
+      if (reg.fullWidthRegister == baseRegister &&
+          reg.offset == elemSize * index && reg.size == elemSize) {
+        return id;
+      }
+    }
+    return 0;
+  }
+
 public:
   explicit AArch64ArchitectureExtension(Architecture* aarch64)
-      : ArchitectureHook(aarch64) {
+      : ArchitectureHook(aarch64) {}
+
+  /*
+   * Initialize the plugin. Returns false on error.
+   */
+  bool Init() {
     std::vector<uint32_t> intrinsics = this->m_base->GetAllIntrinsics();
     uint32_t intrinsic = 0;
     if (!intrinsics.empty()) {
@@ -124,6 +174,44 @@ public:
             {{"reg", Type::IntegerType(8, true, ""), true, Variable()},
              {"val", Type::IntegerType(8, true, ""), true, Variable()}},
             false, 0));
+
+    std::vector<uint32_t> registers = this->m_base->GetAllRegisters();
+    uint32_t reg = 0;
+    if (!registers.empty()) {
+      reg = 1 + *max_element(registers.begin(), registers.end());
+    }
+
+    for (size_t Vd = 0; Vd < 32; Vd++) {
+      char baseRegisterName[3];
+
+      snprintf(baseRegisterName, sizeof(baseRegisterName), "v%zu", Vd);
+
+      for (auto& form : regForms) {
+        BNRegisterInfo regInfo;
+        char* regNameCStr = NULL;
+
+        if (asprintf(&regNameCStr, "v%zu%c[%zu]", Vd, form.elemType,
+                     form.vectorIndex) < 0) {
+          LogError("Error allocating register names: %s", strerror(errno));
+          return false;
+        }
+        assert(NULL != regNameCStr);
+
+        string regName = regNameCStr;
+        free(regNameCStr);
+
+        regInfo.fullWidthRegister =
+            this->m_base->GetRegisterByName(baseRegisterName);
+        regInfo.offset = form.elemSize * form.vectorIndex;
+        regInfo.size = form.elemSize;
+        regInfo.extend = NoExtend;
+
+        mRegisterNames[regName] = reg;
+        mRegisters[reg++] = std::pair<string, BNRegisterInfo>(regName, regInfo);
+      }
+    }
+
+    return true;
   }
 
   bool LiftCSINC(cs_insn* instr, LowLevelILFunction& il) {
@@ -369,20 +457,29 @@ public:
           1 == detail->operands[1].vector_index && 8 == Rd_size &&
           16 == Rn_size) {
         /* FMOV <Xn>, <Vd>.D[1] */
-        il.AddInstruction(il.SetRegister(
-            Rd_size, Rd,
-            il.LowPart(Rd_size,
-                       il.LogicalShiftRight(Rn_size, il.Register(Rn_size, Rn),
-                                            il.Const(1, 64)))));
+        uint32_t subRn = getVectorSubregister(Rn, Rd_size, 1);
+        if (0 == subRn) {
+          LogError("%#lx: Invalid vector element access in operand 1",
+                   instr->address);
+          return false;
+        }
+
+        il.AddInstruction(
+            il.SetRegister(Rd_size, Rd, il.Register(Rd_size, subRn)));
         return true;
       } else if (1 == detail->operands[0].vector_index &&
                  -1 == detail->operands[1].vector_index && 16 == Rd_size &&
                  8 == Rn_size) {
         /* FMOV <Vd>.D[1], <Xn> */
-        il.AddInstruction(il.SetRegister(
-            Rd_size, Rd,
-            il.ZeroExtend(Rd_size, il.Or(Rn_size, il.Register(Rn_size, Rn),
-                                         il.Register(Rn_size, Rd)))));
+        uint32_t subRd = getVectorSubregister(Rd, Rn_size, 1);
+        if (0 == subRd) {
+          LogError("%#lx: Invalid vector element access in operand 0",
+                   instr->address);
+          return false;
+        }
+
+        il.AddInstruction(
+            il.SetRegister(Rn_size, subRd, il.Register(Rn_size, Rn)));
         return true;
       } else if (-1 == detail->operands[0].vector_index &&
                  -1 == detail->operands[1].vector_index) {
@@ -492,7 +589,8 @@ public:
   bool GetInstructionLowLevelIL(const uint8_t* data, uint64_t addr, size_t& len,
                                 LowLevelILFunction& il) override {
     cs_insn* instr;
-    size_t count = cs_disasm(disassembler.Get(), data, len, addr, 0, &instr);
+    size_t count = cs_disasm(disassembler.Get(), data, AARCH64_MAX_INSN_SIZE,
+                             addr, 0, &instr);
 
     bool supported = false;
     if (count > 0) {
@@ -610,6 +708,33 @@ public:
       }
     }
   }
+
+  BNRegisterInfo GetRegisterInfo(uint32_t reg) override {
+    if (mRegisters.find(reg) == mRegisters.end()) {
+      return ArchitectureHook::GetRegisterInfo(reg);
+    } else {
+      return mRegisters[reg].second;
+    }
+  }
+
+  string GetRegisterName(uint32_t reg) override {
+    if (mRegisters.find(reg) == mRegisters.end()) {
+      return ArchitectureHook::GetRegisterName(reg);
+    } else {
+      return mRegisters[reg].first;
+    }
+  }
+
+  std::vector<uint32_t> GetAllRegisters() override {
+    auto base = ArchitectureHook::GetAllRegisters();
+
+    base.reserve(base.size() + mRegisters.size());
+    for (auto& reg : mRegisters) {
+      base.push_back(reg.first);
+    }
+
+    return base;
+  }
 };
 
 extern "C" {
@@ -623,11 +748,15 @@ BINARYNINJAPLUGIN bool CorePluginInit() {
     return false;
   }
 
-  Architecture* aarch64Ext =
+  AArch64ArchitectureExtension* aarch64Ext =
       new AArch64ArchitectureExtension(Architecture::GetByName("aarch64"));
-  Architecture::Register(aarch64Ext);
 
-  LogInfo("Registered AArch64 extensions plugin");
+  if (aarch64Ext->Init()) {
+    Architecture::Register(aarch64Ext);
+    LogInfo("Registered AArch64 extensions plugin");
+  } else {
+    LogError("Failed to initialize AArch64 extensions plugin");
+  }
 
   return true;
 }
