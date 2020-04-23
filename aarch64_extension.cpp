@@ -756,6 +756,7 @@ BINARYNINJAPLUGIN bool CorePluginInit() {
     LogInfo("Registered AArch64 extensions plugin");
   } else {
     LogError("Failed to initialize AArch64 extensions plugin");
+    return false;
   }
 
   return true;
