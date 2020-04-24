@@ -1,5 +1,4 @@
 #include <algorithm>
-#include <assert.h>
 #include <binaryninjaapi.h>
 #include <capstone/capstone.h>
 #include <errno.h>
@@ -28,7 +27,7 @@ template <typename T> inline T Ones(size_t count) {
  * operated on.
  * Verify that the VAS is indeed valid before calling this function.
  */
-static size_t vectorElementSize(enum arm64_vas vas) {
+static std::optional<size_t> vectorElementSize(enum arm64_vas vas) {
   switch (vas) {
   case ARM64_VAS_16B:
   case ARM64_VAS_8B:
@@ -61,8 +60,7 @@ static size_t vectorElementSize(enum arm64_vas vas) {
      * members, we need to fix the caller.
      */
     LogError("%s() called with invalid VAS %d", __FUNCTION__, vas);
-    assert(false);
-    __builtin_unreachable();
+    return {};
   }
 }
 
@@ -185,14 +183,20 @@ private:
     return 0;
   }
 
-  ExprId liftMemOperand(LowLevelILFunction& il, cs_arm64_op& op) {
+  std::optional<ExprId> liftMemOperand(uint64_t address, LowLevelILFunction& il,
+                                       cs_arm64_op& op) {
     uint32_t Rn = this->m_base->GetRegisterByName(
         cs_reg_name(disassembler.Get(), op.mem.base));
     int32_t imm = op.mem.disp;
 
     size_t Rn_size = this->m_base->GetRegisterInfo(Rn).size;
 
-    assert(8 == Rn_size); /* Otherwise capstone was seriously wrong */
+    if (8 != Rn_size) {
+      LogError("%#lx: Invalid disassembly: Rn register (memory operand base) "
+               "must be 8 bytes, not %zu",
+               address, Rn_size);
+      return {};
+    }
 
     if (ARM64_REG_INVALID == op.mem.index) {
       /* No index register, no shifts/extends, just an immediate offset */
@@ -211,8 +215,19 @@ private:
 
       arm64_extender extend = op.ext;
 
-      assert(8 == Rm_size || 4 == Rm_size);
-      assert(0 == imm); /* register and immediate offset cannot be combined */
+      if (8 != Rm_size && 4 != Rm_size) {
+        LogError("%#lx: Invalid disassembly: Rm register (memory operand "
+                 "index) must be 4 or 8 bytes, not %zu",
+                 address, Rm_size);
+        return {};
+      }
+
+      if (0 != imm) {
+        LogError("%#lx: Invalid disassembly: register and immediate offset "
+                 "cannot be combined",
+                 address);
+        return {};
+      }
 
       ExprId disp = il.Register(Rm_size, Rm);
 
@@ -236,15 +251,24 @@ private:
         break;
       case ARM64_EXT_INVALID:
         /* No extend */
-        assert(Rn_size == Rm_size);
+        if (Rn_size != Rm_size) {
+          LogError(
+              "%#lx: Rn and Rm register sizes mismatched and no extend given",
+              address);
+          return {};
+        }
         break;
       default:
-        LogError("Invalid extend type %d", extend);
-        assert(false);
-        __builtin_unreachable();
+        LogError("%#lx: Invalid extend type %d", address, extend);
+        return {};
       }
 
-      assert(shiftAmt <= 4);
+      if (shiftAmt > 4) {
+        LogError("%#lx: Invalid disassembly: shift amount must be <= 4, not %u",
+                 address, shiftAmt);
+        return {};
+      }
+
       switch (shiftType) {
       case ARM64_SFT_LSL:
         disp = il.ShiftLeft(Rn_size, disp, il.Const(1, shiftAmt));
@@ -257,9 +281,8 @@ private:
       case ARM64_SFT_ASR:
       case ARM64_SFT_ROR:
       default:
-        LogError("Invalid shift type %d", shiftType);
-        assert(false);
-        __builtin_unreachable();
+        LogError("%#lx: Invalid shift type %d", address, shiftType);
+        return {};
       }
 
       /* Switch on extend again to do the outer extend */
@@ -277,12 +300,8 @@ private:
         disp = il.SignExtend(Rn_size, disp);
         break;
       case ARM64_EXT_INVALID:
-        /* No extend */
-        assert(Rn_size == Rm_size);
-        break;
       default:
         /* Should be caught above first */
-        assert(false);
         __builtin_unreachable();
       }
 
@@ -339,11 +358,11 @@ public:
         char* regNameCStr = NULL;
 
         if (asprintf(&regNameCStr, "v%zu%c[%zu]", Vd, form.elemType,
-                     form.vectorIndex) < 0) {
+                     form.vectorIndex) < 0 ||
+            NULL == regNameCStr) {
           LogError("Error allocating register names: %s", strerror(errno));
           return false;
         }
-        assert(NULL != regNameCStr);
 
         string regName = regNameCStr;
         free(regNameCStr);
@@ -755,7 +774,12 @@ public:
 
     size_t Rn_size = this->m_base->GetRegisterInfo(Rn).size;
 
-    size_t Rd_elem_size = vectorElementSize(detail->operands[0].vas);
+    auto Rd_elem_size_opt = vectorElementSize(detail->operands[0].vas);
+    if (!Rd_elem_size_opt.has_value()) {
+      return false;
+    }
+    size_t Rd_elem_size = *Rd_elem_size_opt;
+
     int Rd_index = detail->operands[0].vector_index;
     int Rn_index = detail->operands[1].vector_index;
 
@@ -785,7 +809,12 @@ public:
         return false;
       }
 
-      size_t Rn_elem_size = vectorElementSize(detail->operands[1].vas);
+      auto Rn_elem_size_opt = vectorElementSize(detail->operands[0].vas);
+      if (!Rn_elem_size_opt.has_value()) {
+        return false;
+      }
+      size_t Rn_elem_size = *Rn_elem_size_opt;
+
       if (Rd_elem_size != Rn_elem_size) {
         LogError("%#lx: Vector operand element size mismatch: %zu != %zu",
                  instr->address, Rd_elem_size, Rn_elem_size);
@@ -823,7 +852,11 @@ public:
 
     size_t Rt_size = this->m_base->GetRegisterInfo(Rt).size;
 
-    ExprId address = liftMemOperand(il, detail->operands[1]);
+    auto address_opt = liftMemOperand(instr->address, il, detail->operands[1]);
+    if (!address_opt.has_value()) {
+      return false;
+    }
+    ExprId address = *address_opt;
     ExprId value;
 
     if (ARM64_REG_WZR == detail->operands[0].reg ||
@@ -843,7 +876,12 @@ public:
       size_t Rn_size = this->m_base->GetRegisterInfo(Rn).size;
 
       /* Lift address expr again for writeback */
-      address = liftMemOperand(il, detail->operands[1]);
+      auto address_opt =
+          liftMemOperand(instr->address, il, detail->operands[1]);
+      if (!address_opt.has_value()) {
+        return false;
+      }
+      ExprId address = *address_opt;
 
       if (3 == detail->op_count) {
         /* Add post-index */
@@ -853,8 +891,16 @@ public:
           return false;
         }
 
+        if (detail->operands[2].imm > 255 || detail->operands[2].imm < -256) {
+          /* This should be a 9-bit encoding, so that's odd ... */
+          LogError("%#lx: Invalid disassembly: 9-bit immediate post-index out "
+                   "of range: %ld",
+                   instr->address, detail->operands[2].imm);
+          return false;
+        }
+
         address =
-            il.Add(Rn_size, address, il.Const(4, detail->operands[2].imm));
+            il.Add(Rn_size, address, il.Const(2, detail->operands[2].imm));
       }
 
       il.AddInstruction(il.SetRegister(Rn_size, Rn, address));

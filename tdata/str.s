@@ -16,6 +16,7 @@ _start:
     str     s0, [x0], #0xf0
     str     d0, [x0], #0xf0
     str     q0, [x0], #0xf0
+    str     q0, [x0], #-234
 
     /* Pre-index with writeback */
     str     b0, [x0, #0xfc]!
