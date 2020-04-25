@@ -1,5 +1,4 @@
 #include <algorithm>
-#include <assert.h>
 #include <binaryninjaapi.h>
 #include <capstone/capstone.h>
 #include <errno.h>
@@ -12,14 +11,66 @@ using string = std::string;
 // #define AARCH64_TRACE_INSTR
 // #define CAPSTONE_NEXT
 
-#define AARCH64_MAX_INSN_SIZE (4)
+#define AARCH64_MAX_INSTR_SIZE (4)
 
-// Returns 1s expanded to count, e.g.: Count<uint8_t>(7) == 0b01111111
+/**
+ * Returns 1s expanded to count, e.g.: Count<uint8_t>(7) == 0b01111111
+ *
+ * @tparam T integral type to expand into
+ * @param count expansion specifier
+ * @return 1s expanded to count
+ */
 template <typename T> inline T Ones(size_t count) {
   if (count == sizeof(T) * 8) {
     return static_cast<T>(~static_cast<T>(0));
   } else {
     return ~(static_cast<T>(~static_cast<T>(0)) << count);
+  }
+}
+
+/**
+ * Given a Vector Arrangement Specifier, return the _element_ size to be
+ * operated on.
+ *
+ * Verify that the VAS is indeed valid before calling this function.
+ *
+ * @param vas vector arrangement specifier
+ * @return the _element_ size to be operated on
+ */
+static std::optional<size_t> VecElementSize(enum arm64_vas vas) {
+  switch (vas) {
+  case ARM64_VAS_16B:
+  case ARM64_VAS_8B:
+#ifdef CAPSTONE_NEXT
+  case ARM64_VAS_4B:
+  case ARM64_VAS_1B:
+#endif /* #ifdef CAPSTONE_NEXT */
+    return (1);
+  case ARM64_VAS_8H:
+  case ARM64_VAS_4H:
+#ifdef CAPSTONE_NEXT
+  case ARM64_VAS_2H:
+  case ARM64_VAS_1H:
+#endif /* #ifdef CAPSTONE_NEXT */
+    return (2);
+  case ARM64_VAS_4S:
+  case ARM64_VAS_2S:
+#ifdef CAPSTONE_NEXT
+  case ARM64_VAS_1S:
+#endif /* #ifdef CAPSTONE_NEXT */
+    return (4);
+  case ARM64_VAS_2D:
+  case ARM64_VAS_1D:
+    return (8);
+  case ARM64_VAS_1Q:
+    return (16);
+  default:
+    /*
+     * If we've called this with ARM64_VAS_INVALID we're missing new enum
+     * members, we need to fix the caller.
+     */
+    LogError("%s() called with invalid VAS %d", __FUNCTION__, vas);
+    return {};
   }
 }
 
@@ -45,22 +96,24 @@ public:
   csh Get() const { return mCapstone; }
 };
 
-// Disassembler _must_ be thread_local because on multi-threaded analysis
-// GetInstructionLowLevelIL may be called from multiple threads, thus causing
-// Capstone to malfunction. Note that on thread exit the destructor will be
-// called and the associated Capstone resources will be released
+/*
+ * Disassembler _must_ be thread_local because on multi-threaded analysis
+ * GetInstructionLowLevelIL may be called from multiple threads, thus causing
+ * Capstone to malfunction. Note that on thread exit the destructor will be
+ * called and the associated Capstone resources will be released
+ */
 static thread_local Disassembler disassembler;
 
-struct vector_access {
+struct VectorAccess {
   char elemType;
   size_t elemSize;
   size_t vectorIndex;
 };
 
 /*
- * Vector arrangement forms used to generate BinaryNinja subregisters
+ * Vector arrangement forms used to generate Binary Ninja sub-registers.
  */
-const struct vector_access regForms[] = {
+const struct VectorAccess regForms[] = {
     {'d', 8, 0},  {'d', 8, 1},
 
     {'s', 4, 0},  {'s', 4, 1},  {'s', 4, 2},  {'s', 4, 3},
@@ -82,7 +135,7 @@ private:
   std::map<string, uint32_t> mRegisterNames;
 
   /**
-   * Convert a Capstone condition code to BNIL condition code
+   * Convert a Capstone condition code to BNIL condition code.
    *
    * @param condition AArch64 condition code
    * @return BNIL condition, or -1
@@ -128,8 +181,17 @@ private:
     return (BNLowLevelILFlagCondition) -1;
   }
 
-  uint32_t getVectorSubregister(uint32_t baseRegister, size_t elemSize,
-                                size_t index) {
+  /**
+   * Get the vector sub-register corresponding to an element size and base
+   * register.
+   *
+   * @param baseRegister
+   * @param elemSize
+   * @param index
+   * @return the vector sub-register, or 0
+   */
+  uint32_t VecSubRegister(uint32_t baseRegister, size_t elemSize,
+                          size_t index) {
     for (auto& regPair : mRegisters) {
       uint32_t id = regPair.first;
       BNRegisterInfo reg = regPair.second.second;
@@ -142,12 +204,140 @@ private:
     return 0;
   }
 
+  std::optional<ExprId>
+  LiftMemoryOperand(uint64_t address, LowLevelILFunction& il, cs_arm64_op& op) {
+    uint32_t Rn = this->m_base->GetRegisterByName(
+        cs_reg_name(disassembler.Get(), op.mem.base));
+    int32_t imm = op.mem.disp;
+
+    size_t Rn_size = this->m_base->GetRegisterInfo(Rn).size;
+
+    if (8 != Rn_size) {
+      LogError("%#lx: Invalid disassembly: Rn register (memory operand base) "
+               "must be 8 bytes, not %zu",
+               address, Rn_size);
+      return {};
+    }
+
+    if (ARM64_REG_INVALID == op.mem.index) {
+      /* No index register, no shifts/extends, just an immediate offset */
+      if (0 != imm) {
+        return il.Add(Rn_size, il.Register(Rn_size, Rn), il.Const(4, imm));
+      } else {
+        return il.Register(Rn_size, Rn);
+      }
+    } else {
+      uint32_t Rm = this->m_base->GetRegisterByName(
+          cs_reg_name(disassembler.Get(), op.mem.index));
+      size_t Rm_size = this->m_base->GetRegisterInfo(Rm).size;
+
+      arm64_shifter shiftType = op.shift.type;
+      unsigned int shiftAmt = op.shift.value;
+
+      arm64_extender extend = op.ext;
+
+      if (8 != Rm_size && 4 != Rm_size) {
+        LogError("%#lx: Invalid disassembly: Rm register (memory operand "
+                 "index) must be 4 or 8 bytes, not %zu",
+                 address, Rm_size);
+        return {};
+      }
+
+      if (0 != imm) {
+        LogError("%#lx: Invalid disassembly: register and immediate offset "
+                 "cannot be combined",
+                 address);
+        return {};
+      }
+
+      ExprId disp = il.Register(Rm_size, Rm);
+
+      /*
+       * First switch on extend in case Rm is 4 bytes and must be implicitly
+       * extended to 8 before any shifting.
+       * See the ExtendReg() pseudocode in the manual for this logic.
+       */
+      switch (extend) {
+      case ARM64_EXT_UXTB:
+      case ARM64_EXT_UXTH:
+      case ARM64_EXT_UXTW:
+      case ARM64_EXT_UXTX:
+        disp = il.ZeroExtend(Rn_size, disp);
+        break;
+      case ARM64_EXT_SXTB:
+      case ARM64_EXT_SXTH:
+      case ARM64_EXT_SXTW:
+      case ARM64_EXT_SXTX:
+        disp = il.SignExtend(Rn_size, disp);
+        break;
+      case ARM64_EXT_INVALID:
+        /* No extend */
+        if (Rn_size != Rm_size) {
+          LogError(
+              "%#lx: Rn and Rm register sizes mismatched and no extend given",
+              address);
+          return {};
+        }
+        break;
+      default:
+        LogError("%#lx: Invalid extend type %d", address, extend);
+        return {};
+      }
+
+      if (shiftAmt > 4) {
+        LogError("%#lx: Invalid disassembly: shift amount must be <= 4, not %u",
+                 address, shiftAmt);
+        return {};
+      }
+
+      switch (shiftType) {
+      case ARM64_SFT_LSL:
+        disp = il.ShiftLeft(Rn_size, disp, il.Const(1, shiftAmt));
+        break;
+      case ARM64_SFT_INVALID:
+        /* No shift */
+        break;
+      case ARM64_SFT_MSL:
+      case ARM64_SFT_LSR:
+      case ARM64_SFT_ASR:
+      case ARM64_SFT_ROR:
+      default:
+        LogError("%#lx: Invalid shift type %d", address, shiftType);
+        return {};
+      }
+
+      /* Switch on extend again to do the outer extend */
+      switch (extend) {
+      case ARM64_EXT_UXTB:
+      case ARM64_EXT_UXTH:
+      case ARM64_EXT_UXTW:
+      case ARM64_EXT_UXTX:
+        disp = il.ZeroExtend(Rn_size, disp);
+        break;
+      case ARM64_EXT_SXTB:
+      case ARM64_EXT_SXTH:
+      case ARM64_EXT_SXTW:
+      case ARM64_EXT_SXTX:
+        disp = il.SignExtend(Rn_size, disp);
+        break;
+      case ARM64_EXT_INVALID:
+      default:
+        /* Should be caught above first */
+        __builtin_unreachable();
+      }
+
+      return il.Add(Rn_size, il.Register(Rn_size, Rn), disp);
+    }
+  }
+
 public:
   explicit AArch64ArchitectureExtension(Architecture* aarch64)
       : ArchitectureHook(aarch64) {}
 
-  /*
+  /**
    * Initialize the plugin. Returns false on error.
+   *
+   * @return success
    */
   bool Init() {
     std::vector<uint32_t> intrinsics = this->m_base->GetAllIntrinsics();
@@ -187,15 +377,15 @@ public:
       snprintf(baseRegisterName, sizeof(baseRegisterName), "v%zu", Vd);
 
       for (auto& form : regForms) {
-        BNRegisterInfo regInfo;
-        char* regNameCStr = NULL;
+        BNRegisterInfo regInfo{};
+        char* regNameCStr = nullptr;
 
         if (asprintf(&regNameCStr, "v%zu%c[%zu]", Vd, form.elemType,
-                     form.vectorIndex) < 0) {
+                     form.vectorIndex) < 0 ||
+            nullptr == regNameCStr) {
           LogError("Error allocating register names: %s", strerror(errno));
           return false;
         }
-        assert(NULL != regNameCStr);
 
         string regName = regNameCStr;
         free(regNameCStr);
@@ -457,7 +647,7 @@ public:
           1 == detail->operands[1].vector_index && 8 == Rd_size &&
           16 == Rn_size) {
         /* FMOV <Xn>, <Vd>.D[1] */
-        uint32_t subRn = getVectorSubregister(Rn, Rd_size, 1);
+        uint32_t subRn = VecSubRegister(Rn, Rd_size, 1);
         if (0 == subRn) {
           LogError("%#lx: Invalid vector element access in operand 1",
                    instr->address);
@@ -471,7 +661,7 @@ public:
                  -1 == detail->operands[1].vector_index && 16 == Rd_size &&
                  8 == Rn_size) {
         /* FMOV <Vd>.D[1], <Xn> */
-        uint32_t subRd = getVectorSubregister(Rd, Rn_size, 1);
+        uint32_t subRd = VecSubRegister(Rd, Rn_size, 1);
         if (0 == subRd) {
           LogError("%#lx: Invalid vector element access in operand 0",
                    instr->address);
@@ -586,10 +776,167 @@ public:
     return true;
   }
 
+  bool LiftINS(cs_insn* instr, LowLevelILFunction& il) {
+    cs_arm64* detail = &(instr->detail->arm64);
+
+    if (detail->op_count != 2) {
+      return false;
+    }
+
+    if (detail->operands[0].type != ARM64_OP_REG ||
+        -1 == detail->operands[0].vector_index ||
+        ARM64_VAS_INVALID == detail->operands[0].vas ||
+        detail->operands[1].type != ARM64_OP_REG) {
+      return false;
+    }
+
+    uint32_t Rd = this->m_base->GetRegisterByName(
+        cs_reg_name(disassembler.Get(), detail->operands[0].reg));
+    uint32_t Rn = this->m_base->GetRegisterByName(
+        cs_reg_name(disassembler.Get(), detail->operands[1].reg));
+
+    size_t Rn_size = this->m_base->GetRegisterInfo(Rn).size;
+
+    auto Rd_elem_size_opt = VecElementSize(detail->operands[0].vas);
+    if (!Rd_elem_size_opt.has_value()) {
+      return false;
+    }
+    size_t Rd_elem_size = *Rd_elem_size_opt;
+
+    int Rd_index = detail->operands[0].vector_index;
+    int Rn_index = detail->operands[1].vector_index;
+
+    uint32_t subRd = VecSubRegister(Rd, Rn_size, Rd_index);
+    if (0 == subRd) {
+      LogError("%#lx: Invalid vector element access in operand 0",
+               instr->address);
+      return false;
+    }
+
+    if (-1 == Rn_index) {
+      /* INS (general) */
+      if (Rd_elem_size != Rn_size) {
+        LogError("%#lx: Operand size mismatch: Vd.Ts size %zu, Rn size %zu",
+                 instr->address, Rd_elem_size, Rn_size);
+        return false;
+      }
+
+      il.AddInstruction(
+          il.SetRegister(Rn_size, subRd, il.Register(Rn_size, Rn)));
+    } else {
+      /* INS (element) */
+
+      if (ARM64_VAS_INVALID == detail->operands[1].vas) {
+        LogError("%#lx: Vector operand 1 missing arrangement specifier",
+                 instr->address);
+        return false;
+      }
+
+      auto Rn_elem_size_opt = VecElementSize(detail->operands[0].vas);
+      if (!Rn_elem_size_opt.has_value()) {
+        return false;
+      }
+      size_t Rn_elem_size = *Rn_elem_size_opt;
+
+      if (Rd_elem_size != Rn_elem_size) {
+        LogError("%#lx: Vector operand element size mismatch: %zu != %zu",
+                 instr->address, Rd_elem_size, Rn_elem_size);
+        return false;
+      }
+
+      uint32_t subRn = VecSubRegister(Rn, Rn_size, Rd_index);
+      if (0 == subRn) {
+        LogError("%#lx: Invalid vector element access in operand 1",
+                 instr->address);
+        return false;
+      }
+
+      il.AddInstruction(il.SetRegister(Rd_elem_size, subRd,
+                                       il.Register(Rn_elem_size, subRn)));
+    }
+
+    return true;
+  }
+
+  bool LiftSTR(cs_insn* instr, LowLevelILFunction& il) {
+    cs_arm64* detail = &(instr->detail->arm64);
+
+    if (detail->op_count != 2 && detail->op_count != 3) {
+      return false;
+    }
+
+    if (detail->operands[0].type != ARM64_OP_REG ||
+        detail->operands[1].type != ARM64_OP_MEM) {
+      return false;
+    }
+
+    uint32_t Rt = this->m_base->GetRegisterByName(
+        cs_reg_name(disassembler.Get(), detail->operands[0].reg));
+
+    size_t Rt_size = this->m_base->GetRegisterInfo(Rt).size;
+
+    auto address_opt =
+        LiftMemoryOperand(instr->address, il, detail->operands[1]);
+    if (!address_opt.has_value()) {
+      return false;
+    }
+    ExprId address = *address_opt;
+    ExprId value;
+
+    if (ARM64_REG_WZR == detail->operands[0].reg ||
+        ARM64_REG_XZR == detail->operands[0].reg) {
+      /* The zero register doesn't count */
+      value = il.Const(1, 0);
+    } else {
+      value = il.Register(Rt_size, Rt);
+    }
+
+    il.AddInstruction(il.Store(Rt_size, address, value));
+
+    if (detail->writeback) {
+      /* Lift write-back to base register (Rn) */
+      uint32_t Rn = this->m_base->GetRegisterByName(
+          cs_reg_name(disassembler.Get(), detail->operands[1].mem.base));
+      size_t Rn_size = this->m_base->GetRegisterInfo(Rn).size;
+
+      /* Lift address expr again for writeback */
+      auto address_opt =
+          LiftMemoryOperand(instr->address, il, detail->operands[1]);
+      if (!address_opt.has_value()) {
+        return false;
+      }
+      ExprId address = *address_opt;
+
+      if (3 == detail->op_count) {
+        /* Add post-index */
+        if (ARM64_OP_IMM != detail->operands[2].type) {
+          LogError("%#lx: Expected immediate or nothing for operand 2",
+                   instr->address);
+          return false;
+        }
+
+        if (detail->operands[2].imm > 255 || detail->operands[2].imm < -256) {
+          /* This should be a 9-bit encoding, so that's odd ... */
+          LogError("%#lx: Invalid disassembly: 9-bit immediate post-index out "
+                   "of range: %ld",
+                   instr->address, detail->operands[2].imm);
+          return false;
+        }
+
+        address =
+            il.Add(Rn_size, address, il.Const(2, detail->operands[2].imm));
+      }
+
+      il.AddInstruction(il.SetRegister(Rn_size, Rn, address));
+    }
+
+    return true;
+  }
+
   bool GetInstructionLowLevelIL(const uint8_t* data, uint64_t addr, size_t& len,
                                 LowLevelILFunction& il) override {
     cs_insn* instr;
-    size_t count = cs_disasm(disassembler.Get(), data, AARCH64_MAX_INSN_SIZE,
+    size_t count = cs_disasm(disassembler.Get(), data, AARCH64_MAX_INSTR_SIZE,
                              addr, 0, &instr);
 
     bool supported = false;
@@ -642,6 +989,21 @@ public:
         LogInfo("MSR @ 0x%lx", instr->address);
 #endif
         supported = LiftMSR(instr, il);
+        break;
+      case ARM64_INS_MOV:
+        /* Capstone (sometimes?) uses this alias for INS... */
+        /* fall through, only handles INS-like operands */
+      case ARM64_INS_INS:
+#ifdef AARCH64_TRACE_INSTR
+        LogInfo("INS @ 0x%lx", instr->address);
+#endif
+        supported = LiftINS(instr, il);
+        break;
+      case ARM64_INS_STR:
+#ifdef AARCH64_TRACE_INSTR
+        LogInfo("STR @ 0x%lx", instr->address);
+#endif
+        supported = LiftSTR(instr, il);
         break;
       }
     }
@@ -748,7 +1110,7 @@ BINARYNINJAPLUGIN bool CorePluginInit() {
     return false;
   }
 
-  AArch64ArchitectureExtension* aarch64Ext =
+  auto* aarch64Ext =
       new AArch64ArchitectureExtension(Architecture::GetByName("aarch64"));
 
   if (aarch64Ext->Init()) {

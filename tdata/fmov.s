@@ -1,5 +1,5 @@
 /*
- * aarch64-linux-gnu-as -mcpu=cortex-a77 fmov.s -o fmov.o
+ * aarch64-linux-gnu-as -mcpu=all fmov.s -o fmov.o
  */
 
 _start:
