@@ -11,9 +11,15 @@ using string = std::string;
 // #define AARCH64_TRACE_INSTR
 // #define CAPSTONE_NEXT
 
-#define AARCH64_MAX_INSN_SIZE (4)
+#define AARCH64_MAX_INSTR_SIZE (4)
 
-// Returns 1s expanded to count, e.g.: Count<uint8_t>(7) == 0b01111111
+/**
+ * Returns 1s expanded to count, e.g.: Count<uint8_t>(7) == 0b01111111
+ *
+ * @tparam T integral type to expand into
+ * @param count expansion specifier
+ * @return 1s expanded to count
+ */
 template <typename T> inline T Ones(size_t count) {
   if (count == sizeof(T) * 8) {
     return static_cast<T>(~static_cast<T>(0));
@@ -22,12 +28,16 @@ template <typename T> inline T Ones(size_t count) {
   }
 }
 
-/*
+/**
  * Given a Vector Arrangement Specifier, return the _element_ size to be
  * operated on.
+ *
  * Verify that the VAS is indeed valid before calling this function.
+ *
+ * @param vas vector arrangement specifier
+ * @return the _element_ size to be operated on
  */
-static std::optional<size_t> vectorElementSize(enum arm64_vas vas) {
+static std::optional<size_t> VecElementSize(enum arm64_vas vas) {
   switch (vas) {
   case ARM64_VAS_16B:
   case ARM64_VAS_8B:
@@ -86,22 +96,24 @@ public:
   csh Get() const { return mCapstone; }
 };
 
-// Disassembler _must_ be thread_local because on multi-threaded analysis
-// GetInstructionLowLevelIL may be called from multiple threads, thus causing
-// Capstone to malfunction. Note that on thread exit the destructor will be
-// called and the associated Capstone resources will be released
+/*
+ * Disassembler _must_ be thread_local because on multi-threaded analysis
+ * GetInstructionLowLevelIL may be called from multiple threads, thus causing
+ * Capstone to malfunction. Note that on thread exit the destructor will be
+ * called and the associated Capstone resources will be released
+ */
 static thread_local Disassembler disassembler;
 
-struct vector_access {
+struct VectorAccess {
   char elemType;
   size_t elemSize;
   size_t vectorIndex;
 };
 
 /*
- * Vector arrangement forms used to generate BinaryNinja subregisters
+ * Vector arrangement forms used to generate Binary Ninja sub-registers.
  */
-const struct vector_access regForms[] = {
+const struct VectorAccess regForms[] = {
     {'d', 8, 0},  {'d', 8, 1},
 
     {'s', 4, 0},  {'s', 4, 1},  {'s', 4, 2},  {'s', 4, 3},
@@ -123,7 +135,7 @@ private:
   std::map<string, uint32_t> mRegisterNames;
 
   /**
-   * Convert a Capstone condition code to BNIL condition code
+   * Convert a Capstone condition code to BNIL condition code.
    *
    * @param condition AArch64 condition code
    * @return BNIL condition, or -1
@@ -169,8 +181,17 @@ private:
     return (BNLowLevelILFlagCondition) -1;
   }
 
-  uint32_t getVectorSubregister(uint32_t baseRegister, size_t elemSize,
-                                size_t index) {
+  /**
+   * Get the vector sub-register corresponding to an element size and base
+   * register.
+   *
+   * @param baseRegister
+   * @param elemSize
+   * @param index
+   * @return the vector sub-register, or 0
+   */
+  uint32_t VecSubRegister(uint32_t baseRegister, size_t elemSize,
+                          size_t index) {
     for (auto& regPair : mRegisters) {
       uint32_t id = regPair.first;
       BNRegisterInfo reg = regPair.second.second;
@@ -183,8 +204,8 @@ private:
     return 0;
   }
 
-  std::optional<ExprId> liftMemOperand(uint64_t address, LowLevelILFunction& il,
-                                       cs_arm64_op& op) {
+  std::optional<ExprId>
+  LiftMemoryOperand(uint64_t address, LowLevelILFunction& il, cs_arm64_op& op) {
     uint32_t Rn = this->m_base->GetRegisterByName(
         cs_reg_name(disassembler.Get(), op.mem.base));
     int32_t imm = op.mem.disp;
@@ -313,8 +334,10 @@ public:
   explicit AArch64ArchitectureExtension(Architecture* aarch64)
       : ArchitectureHook(aarch64) {}
 
-  /*
+  /**
    * Initialize the plugin. Returns false on error.
+   *
+   * @return success
    */
   bool Init() {
     std::vector<uint32_t> intrinsics = this->m_base->GetAllIntrinsics();
@@ -354,12 +377,12 @@ public:
       snprintf(baseRegisterName, sizeof(baseRegisterName), "v%zu", Vd);
 
       for (auto& form : regForms) {
-        BNRegisterInfo regInfo;
-        char* regNameCStr = NULL;
+        BNRegisterInfo regInfo{};
+        char* regNameCStr = nullptr;
 
         if (asprintf(&regNameCStr, "v%zu%c[%zu]", Vd, form.elemType,
                      form.vectorIndex) < 0 ||
-            NULL == regNameCStr) {
+            nullptr == regNameCStr) {
           LogError("Error allocating register names: %s", strerror(errno));
           return false;
         }
@@ -624,7 +647,7 @@ public:
           1 == detail->operands[1].vector_index && 8 == Rd_size &&
           16 == Rn_size) {
         /* FMOV <Xn>, <Vd>.D[1] */
-        uint32_t subRn = getVectorSubregister(Rn, Rd_size, 1);
+        uint32_t subRn = VecSubRegister(Rn, Rd_size, 1);
         if (0 == subRn) {
           LogError("%#lx: Invalid vector element access in operand 1",
                    instr->address);
@@ -638,7 +661,7 @@ public:
                  -1 == detail->operands[1].vector_index && 16 == Rd_size &&
                  8 == Rn_size) {
         /* FMOV <Vd>.D[1], <Xn> */
-        uint32_t subRd = getVectorSubregister(Rd, Rn_size, 1);
+        uint32_t subRd = VecSubRegister(Rd, Rn_size, 1);
         if (0 == subRd) {
           LogError("%#lx: Invalid vector element access in operand 0",
                    instr->address);
@@ -774,7 +797,7 @@ public:
 
     size_t Rn_size = this->m_base->GetRegisterInfo(Rn).size;
 
-    auto Rd_elem_size_opt = vectorElementSize(detail->operands[0].vas);
+    auto Rd_elem_size_opt = VecElementSize(detail->operands[0].vas);
     if (!Rd_elem_size_opt.has_value()) {
       return false;
     }
@@ -783,7 +806,7 @@ public:
     int Rd_index = detail->operands[0].vector_index;
     int Rn_index = detail->operands[1].vector_index;
 
-    uint32_t subRd = getVectorSubregister(Rd, Rn_size, Rd_index);
+    uint32_t subRd = VecSubRegister(Rd, Rn_size, Rd_index);
     if (0 == subRd) {
       LogError("%#lx: Invalid vector element access in operand 0",
                instr->address);
@@ -809,7 +832,7 @@ public:
         return false;
       }
 
-      auto Rn_elem_size_opt = vectorElementSize(detail->operands[0].vas);
+      auto Rn_elem_size_opt = VecElementSize(detail->operands[0].vas);
       if (!Rn_elem_size_opt.has_value()) {
         return false;
       }
@@ -821,7 +844,7 @@ public:
         return false;
       }
 
-      uint32_t subRn = getVectorSubregister(Rn, Rn_size, Rd_index);
+      uint32_t subRn = VecSubRegister(Rn, Rn_size, Rd_index);
       if (0 == subRn) {
         LogError("%#lx: Invalid vector element access in operand 1",
                  instr->address);
@@ -852,7 +875,8 @@ public:
 
     size_t Rt_size = this->m_base->GetRegisterInfo(Rt).size;
 
-    auto address_opt = liftMemOperand(instr->address, il, detail->operands[1]);
+    auto address_opt =
+        LiftMemoryOperand(instr->address, il, detail->operands[1]);
     if (!address_opt.has_value()) {
       return false;
     }
@@ -877,7 +901,7 @@ public:
 
       /* Lift address expr again for writeback */
       auto address_opt =
-          liftMemOperand(instr->address, il, detail->operands[1]);
+          LiftMemoryOperand(instr->address, il, detail->operands[1]);
       if (!address_opt.has_value()) {
         return false;
       }
@@ -912,7 +936,7 @@ public:
   bool GetInstructionLowLevelIL(const uint8_t* data, uint64_t addr, size_t& len,
                                 LowLevelILFunction& il) override {
     cs_insn* instr;
-    size_t count = cs_disasm(disassembler.Get(), data, AARCH64_MAX_INSN_SIZE,
+    size_t count = cs_disasm(disassembler.Get(), data, AARCH64_MAX_INSTR_SIZE,
                              addr, 0, &instr);
 
     bool supported = false;
@@ -1086,7 +1110,7 @@ BINARYNINJAPLUGIN bool CorePluginInit() {
     return false;
   }
 
-  AArch64ArchitectureExtension* aarch64Ext =
+  auto* aarch64Ext =
       new AArch64ArchitectureExtension(Architecture::GetByName("aarch64"));
 
   if (aarch64Ext->Init()) {
@@ -1094,6 +1118,7 @@ BINARYNINJAPLUGIN bool CorePluginInit() {
     LogInfo("Registered AArch64 extensions plugin");
   } else {
     LogError("Failed to initialize AArch64 extensions plugin");
+    return false;
   }
 
   return true;
