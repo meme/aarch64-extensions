@@ -33,5 +33,5 @@ include_directories(capstone/include)
 
 add_subdirectory(capstone)
 
-add_library(aarch64_extension SHARED A64.cpp A64.h LiftDT.cpp LiftDT.h LiftFP.cpp LiftFP.h LiftGR.cpp LiftGR.h LiftVT.cpp LiftVT.h)
+add_library(aarch64_extension SHARED src/A64.cpp src/A64.h src/LiftDT.cpp src/LiftDT.h src/LiftFP.cpp src/LiftFP.h src/LiftGR.cpp src/LiftGR.h src/LiftVT.cpp src/LiftVT.h)
 target_link_libraries(aarch64_extension binaryninjaapi capstone-static)
