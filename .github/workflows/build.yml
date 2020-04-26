@@ -28,4 +28,4 @@ jobs:
       - uses: actions/upload-artifact@v1
         with:
           name: libaarch64_extension.so
-          path: $GITHUB_WORKSPACE/build/libaarch64_extension.so
+          path: ${{ github.workspace }}/build/libaarch64_extension.so

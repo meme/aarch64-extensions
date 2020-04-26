@@ -372,7 +372,7 @@ public:
     }
 
     for (size_t Vd = 0; Vd < 32; Vd++) {
-      char baseRegisterName[3];
+      char baseRegisterName[4];
 
       snprintf(baseRegisterName, sizeof(baseRegisterName), "v%zu", Vd);
 
