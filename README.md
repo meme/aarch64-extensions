@@ -1,6 +1,8 @@
 aarch64-extensions
 ==================
 
+#### Binary Ninja AArch64 modules are now open-source: https://github.com/Vector35/arch-arm64. This work will slowly be upstreamed and this repository is no longer accepting contributions.
+
 Binary Ninja IL lifting extensions for AArch64
 
 - [x] CSINC
